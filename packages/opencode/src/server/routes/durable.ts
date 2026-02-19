@@ -819,14 +819,15 @@ async function cleanupWorkspaceInput(input: z.infer<typeof CleanupInput>) {
   const refs = new Set<string>()
   const workspaceRef = input.workspaceRef?.trim() || ""
   const executionId = input.executionId?.trim() || ""
+  if (!workspaceRef && !executionId) {
+    throw new Error("workspaceRef or executionId is required")
+  }
   if (workspaceRef) refs.add(workspaceRef)
   if (executionId) {
     const ref = executionToWorkspace.get(executionId)
     if (ref) refs.add(ref)
   }
-  if (!refs.size) {
-    throw new Error("workspaceRef or executionId is required")
-  }
+  if (!refs.size) return []
   const cleanedWorkspaceRefs = (
     await Promise.all(
       [...refs].map(async (ref) => {
