@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+.vscode
+node_modules
+**/node_modules
+**/.turbo
+**/.next
+**/dist
+**/coverage
+*.log
