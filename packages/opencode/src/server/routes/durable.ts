@@ -887,8 +887,20 @@ function parseTools(input: z.infer<typeof RunInput>): Record<string, boolean> | 
 }
 
 function parseModel(input: z.infer<typeof RunInput>) {
-  const model = input.agentConfig?.modelSpec ?? input.model
+  const model = (input.agentConfig?.modelSpec ?? input.model)?.trim()
   if (!model) return undefined
+  const normalized = model.toLowerCase()
+  if (normalized === "anthropic/claude-opus-4-6" || normalized === "anthropic/claude-opus-4.6") {
+    const anthropicKey = process.env.ANTHROPIC_API_KEY?.trim()
+    if (anthropicKey) return Provider.parseModel("anthropic/claude-opus-4-6")
+    const fallbackModel = process.env.OPENAI_CHAT_FALLBACK_MODEL?.trim() || "gpt-4o"
+    const fallback = `openai/${fallbackModel}`
+    log.warn("anthropic model unavailable, falling back to configured openai model", {
+      requested: model,
+      fallback,
+    })
+    return Provider.parseModel(fallback)
+  }
   return Provider.parseModel(model)
 }
 
