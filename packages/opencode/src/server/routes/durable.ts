@@ -1432,6 +1432,19 @@ const opusModelPreferences = [
   "claude-opus-4",
 ]
 
+const opusProviderOrder = [
+  "anthropic",
+  "google-vertex-anthropic",
+  "openrouter",
+]
+
+const opusModelNeedles = [
+  "claude-opus-4-6",
+  "claude-opus-4.6",
+  "claude-opus-4",
+  "claude-4-opus",
+]
+
 function normalizeModelInput(input: string) {
   const trimmed = input.trim()
   if (!trimmed) return ""
@@ -1442,17 +1455,43 @@ function normalizeModelInput(input: string) {
   return trimmed.toLowerCase()
 }
 
+function findModelID(models: Record<string, unknown>, values: string[]) {
+  const ids = Object.keys(models)
+  for (const value of values) {
+    const exact = ids.find((id) => id.toLowerCase() === value)
+    if (exact) return exact
+  }
+  for (const value of values) {
+    const partial = ids.find((id) => id.toLowerCase().includes(value))
+    if (partial) return partial
+  }
+}
+
 async function resolveOpusModel(): Promise<ModelRef> {
-  const provider = await Provider.getProvider("anthropic")
-  if (!provider) {
-    throw new Error("invalid model: anthropic provider is not configured")
+  const providers = await Provider.list()
+  const providerIDs = [...new Set([...opusProviderOrder, ...Object.keys(providers)])]
+  for (const modelID of opusModelPreferences.map((value) => value.toLowerCase())) {
+    for (const providerID of providerIDs) {
+      const provider = providers[providerID]
+      if (!provider) continue
+      const resolved = findModelID(provider.models, [modelID])
+      if (!resolved) continue
+      return { providerID, modelID: resolved }
+    }
   }
-  for (const modelID of opusModelPreferences) {
-    if (provider.models[modelID]) return { providerID: "anthropic", modelID }
+  for (const providerID of providerIDs) {
+    const provider = providers[providerID]
+    if (!provider) continue
+    const resolved = findModelID(provider.models, opusModelNeedles)
+    if (!resolved) continue
+    return { providerID, modelID: resolved }
   }
-  const candidates = Object.keys(provider.models).filter((modelID) => modelID.includes("claude-opus-4"))
-  if (candidates.length > 0) return { providerID: "anthropic", modelID: candidates[0]! }
-  throw new Error("invalid model: anthropic provider has no claude opus model available")
+  const connected = Object.keys(providers)
+  throw new Error(
+    `invalid model: claude-opus-4.6 is not available from connected providers (${connected.join(
+      ", ",
+    ) || "none"}). Configure ANTHROPIC_API_KEY or OPENROUTER_API_KEY for durable-agent.`,
+  )
 }
 
 async function resolveModel(input: z.infer<typeof RunInput>) {
@@ -1481,6 +1520,61 @@ async function resolveModel(input: z.infer<typeof RunInput>) {
     }
     throw error
   }
+}
+
+async function resolveAgentModel(agent: NonNullable<Awaited<ReturnType<typeof Agent.get>>>) {
+  const configured = agent.model
+  if (!configured) return await Provider.defaultModel()
+  const provider = await Provider.getProvider(configured.providerID)
+  if (provider?.models[configured.modelID]) return configured
+  const configuredSpec = `${configured.providerID}/${configured.modelID}`
+  const normalized = normalizeModelInput(configuredSpec)
+  if (opus46Aliases.has(normalized)) {
+    const resolved = await resolveOpusModel()
+    log.warn("agent model unavailable, using opus fallback", {
+      agent: agent.name,
+      configured: configuredSpec,
+      resolved: `${resolved.providerID}/${resolved.modelID}`,
+    })
+    return resolved
+  }
+  const connected = await Provider.list().then((items) => Object.keys(items))
+  throw new Error(
+    `invalid model: ${configuredSpec} is not available from connected providers (${connected.join(
+      ", ",
+    ) || "none"}). Configure provider credentials or override model per run.`,
+  )
+}
+
+async function runPrompt(input: {
+  prompt: string
+  cwd?: string
+  agent?: string
+  model?: ModelRef
+  tools?: Record<string, boolean>
+  instructions?: string
+}) {
+  return await withDir(input.cwd, async () => {
+    const agentName = input.agent ?? (await Agent.defaultAgent())
+    const agent = await Agent.get(agentName)
+    if (!agent) {
+      throw new Error(`Agent "${agentName}" not found`)
+    }
+    const model = input.model ?? (await resolveAgentModel(agent))
+    return await SessionPrompt.prompt({
+      sessionID: (await Session.create({ title: `Durable ${agentName}` })).id,
+      agent: agentName,
+      model,
+      tools: input.tools,
+      system: input.instructions,
+      parts: [
+        {
+          type: "text",
+          text: input.prompt,
+        },
+      ],
+    })
+  })
 }
 
 function isInputValidationError(message: string) {
@@ -1654,36 +1748,6 @@ async function withDir<T>(cwd: string | undefined, fn: () => Promise<T>) {
     directory: trimmed,
     init: InstanceBootstrap,
     fn,
-  })
-}
-
-async function runPrompt(input: {
-  prompt: string
-  cwd?: string
-  agent?: string
-  model?: ModelRef
-  tools?: Record<string, boolean>
-  instructions?: string
-}) {
-  return await withDir(input.cwd, async () => {
-    const agentName = input.agent ?? (await Agent.defaultAgent())
-    const agent = await Agent.get(agentName)
-    if (!agent) {
-      throw new Error(`Agent "${agentName}" not found`)
-    }
-    return await SessionPrompt.prompt({
-      sessionID: (await Session.create({ title: `Durable ${agentName}` })).id,
-      agent: agentName,
-      model: input.model,
-      tools: input.tools,
-      system: input.instructions,
-      parts: [
-        {
-          type: "text",
-          text: input.prompt,
-        },
-      ],
-    })
   })
 }
 
