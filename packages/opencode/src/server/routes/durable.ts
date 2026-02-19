@@ -54,6 +54,7 @@ const RunInput = z.object({
   instructions: z.string().optional(),
   maxTurns: z.coerce.number().int().positive().optional(),
   cwd: z.string().optional(),
+  workspaceRef: z.string().optional(),
   executionId: z.string().optional(),
   dbExecutionId: z.string().optional(),
   parentExecutionId: z.string().optional(),
@@ -128,11 +129,13 @@ const WorkspaceCommandInput = z.object({
   timeoutMs: z.number().int().positive().optional(),
 })
 
+const WorkspaceFileOperationName = z.enum(["read", "write", "edit", "list"])
+
 const WorkspaceFileInput = z.object({
   workspaceRef: z.string().optional(),
   executionId: z.string().optional(),
   durableInstanceId: z.string().optional(),
-  operation: z.string().optional(),
+  operation: WorkspaceFileOperationName,
   path: z.string().optional(),
   content: z.string().optional(),
   old_string: z.string().optional(),
@@ -177,11 +180,27 @@ const WorkspaceActionResponse = z.object({
   error: z.string().optional(),
 })
 
+const ToolsResponse = z.object({
+  success: z.literal(true),
+  tools: z.array(
+    z.object({
+      id: WorkspaceToolName,
+      description: z.string(),
+    }),
+  ),
+})
+
 type ModelRef = { providerID: string; modelID: string }
 
 type DurableRunPayload = {
   workflowID: string
   parentExecutionID?: string
+  executionID?: string
+  dbExecutionID?: string
+  workflowDefinitionID?: string
+  nodeID?: string
+  nodeName?: string
+  workspaceRef?: string
   prompt: string
   cwd?: string
   agent?: string
@@ -269,7 +288,14 @@ function rid(prefix: string) {
 }
 
 const workspaceTools = WorkspaceToolName.options
-const workspaceFileOperations = ["read_file", "write_file", "edit_file", "list_files", "delete_file", "mkdir", "file_stat"] as const
+const workspaceFileOperations = WorkspaceFileOperationName.options
+const workspaceToolDescriptions: Record<WorkspaceTool, string> = {
+  read: "Read files",
+  write: "Write files",
+  edit: "Edit files",
+  list: "List files/directories",
+  bash: "Run shell commands",
+}
 
 function workspaceBaseRoot() {
   const configured = process.env.WORKSPACE_SESSIONS_ROOT?.trim()
@@ -293,16 +319,18 @@ function parseWorkspaceTimeout(input: unknown) {
 }
 
 function parseWorkspaceEnabledTools(input: unknown): WorkspaceTool[] {
-  if (!input) return [...workspaceTools]
-  if (!Array.isArray(input)) return [...workspaceTools]
-  const tools = input.flatMap((item) => {
-    if (typeof item !== "string") return []
+  if (typeof input === "undefined") return [...workspaceTools]
+  if (!Array.isArray(input)) throw new Error("enabledTools must be an array of read, write, edit, list, bash")
+  return [...new Set(input.map((item) => {
+    if (typeof item !== "string") {
+      throw new Error("enabledTools must be an array of read, write, edit, list, bash")
+    }
     const value = item.trim()
-    if (!value || !workspaceTools.includes(value as WorkspaceTool)) return []
-    return [value as WorkspaceTool]
-  })
-  if (!tools.length) return [...workspaceTools]
-  return [...new Set(tools)]
+    if (!workspaceTools.includes(value as WorkspaceTool)) {
+      throw new Error(`enabledTools contains unsupported tool: ${value || "<empty>"}`)
+    }
+    return value as WorkspaceTool
+  }))]
 }
 
 function workspaceRecord(session: WorkspaceSession): WorkspaceSessionRecord {
@@ -689,25 +717,24 @@ function isWorkspaceFileOperation(input: string): input is (typeof workspaceFile
 }
 
 function workspaceToolForOperation(operation: (typeof workspaceFileOperations)[number]): WorkspaceTool {
-  if (operation === "read_file") return "read"
-  if (operation === "write_file") return "write"
-  if (operation === "edit_file") return "edit"
-  if (operation === "list_files") return "list"
-  return "bash"
+  if (operation === "read") return "read"
+  if (operation === "write") return "write"
+  if (operation === "edit") return "edit"
+  return "list"
 }
 
 async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInput>) {
   const session = await resolveWorkspaceFromInput(input)
-  const operation = input.operation?.trim() || ""
+  const operation = input.operation
   if (!isWorkspaceFileOperation(operation)) {
     throw new Error(
-      "operation is required and must be one of read_file, write_file, edit_file, list_files, delete_file, mkdir, file_stat",
+      "operation must be one of read, write, edit, list",
     )
   }
   assertWorkspaceTool(session, workspaceToolForOperation(operation))
   await bindWorkspaceDurableInstance(session, parseDurableInstanceID(input))
 
-  if (operation === "read_file") {
+  if (operation === "read") {
     const fullPath = resolveWorkspacePath(session, input.path, operation)
     const file = Bun.file(fullPath)
     if (!(await file.exists())) throw new Error(`path not found: ${input.path}`)
@@ -718,7 +745,7 @@ async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInpu
     return { content }
   }
 
-  if (operation === "write_file") {
+  if (operation === "write") {
     const fullPath = resolveWorkspacePath(session, input.path, operation)
     assertCloneScope(session, fullPath, operation)
     await enforceReadBeforeWrite(session, fullPath)
@@ -728,12 +755,12 @@ async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInpu
     return { path: input.path ?? "" }
   }
 
-  if (operation === "edit_file") {
+  if (operation === "edit") {
     const fullPath = resolveWorkspacePath(session, input.path, operation)
     assertCloneScope(session, fullPath, operation)
     await enforceReadBeforeWrite(session, fullPath)
     const oldString = input.old_string ?? ""
-    if (!oldString) throw new Error("old_string is required for edit_file")
+    if (!oldString) throw new Error("old_string is required for edit")
     const file = Bun.file(fullPath)
     if (!(await file.exists())) throw new Error(`path not found: ${input.path}`)
     const current = await file.text()
@@ -744,7 +771,7 @@ async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInpu
     return { path: input.path ?? "" }
   }
 
-  if (operation === "list_files") {
+  if (operation === "list") {
     const fullPath = path.resolve(session.rootPath, input.path?.trim() || ".")
     if (!Filesystem.contains(session.rootPath, fullPath)) throw new Error(`path "${input.path}" escapes workspace root`)
     const entries = await fs.readdir(fullPath, { withFileTypes: true })
@@ -758,38 +785,7 @@ async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInpu
     }
   }
 
-  if (operation === "delete_file") {
-    const fullPath = resolveWorkspacePath(session, input.path, operation)
-    assertCloneScope(session, fullPath, operation)
-    await fs.rm(fullPath, { recursive: true, force: true })
-    touchWorkspace(session)
-    await persistWorkspaceStore()
-    return {
-      deleted: true,
-      path: input.path ?? "",
-    }
-  }
-
-  if (operation === "mkdir") {
-    const fullPath = resolveWorkspacePath(session, input.path, operation)
-    assertCloneScope(session, fullPath, operation)
-    await fs.mkdir(fullPath, { recursive: true })
-    touchWorkspace(session)
-    await persistWorkspaceStore()
-    return { path: input.path ?? "" }
-  }
-
-  const fullPath = resolveWorkspacePath(session, input.path, operation)
-  const stat = await fs.stat(fullPath)
-  touchWorkspace(session)
-  await persistWorkspaceStore()
-  return {
-    size: stat.size,
-    isFile: stat.isFile(),
-    isDirectory: stat.isDirectory(),
-    modified: stat.mtime.toISOString(),
-    created: stat.birthtime.toISOString(),
-  }
+  throw new Error("operation must be one of read, write, edit, list")
 }
 
 async function cleanupWorkspaceRef(workspaceRef: string) {
@@ -1005,6 +1001,12 @@ function toResult(message: MessageV2.WithParts) {
 async function publishCompletion(input: {
   workflowID: string
   parentExecutionID?: string
+  executionID?: string
+  dbExecutionID?: string
+  workflowDefinitionID?: string
+  nodeID?: string
+  nodeName?: string
+  workspaceRef?: string
   success: boolean
   result?: Record<string, unknown>
   error?: string
@@ -1024,6 +1026,13 @@ async function publishCompletion(input: {
       success: input.success,
       result: input.result ?? {},
       error: input.error,
+      parentExecutionId: parent,
+      executionId: input.executionID,
+      dbExecutionId: input.dbExecutionID,
+      workflowId: input.workflowDefinitionID,
+      nodeId: input.nodeID,
+      nodeName: input.nodeName,
+      workspaceRef: input.workspaceRef,
       timestamp: new Date().toISOString(),
     },
   }
@@ -1118,6 +1127,12 @@ async function durablePublishCompletionActivity(
   input: {
     workflowID: string
     parentExecutionID?: string
+    executionID?: string
+    dbExecutionID?: string
+    workflowDefinitionID?: string
+    nodeID?: string
+    nodeName?: string
+    workspaceRef?: string
     success: boolean
     result?: Record<string, unknown>
     error?: string
@@ -1172,6 +1187,12 @@ async function* durableRunWorkflow(
     yield ctx.callActivity(durablePublishCompletionActivity, {
       workflowID: input.workflowID,
       parentExecutionID: input.parentExecutionID,
+      executionID: input.executionID,
+      dbExecutionID: input.dbExecutionID,
+      workflowDefinitionID: input.workflowDefinitionID,
+      nodeID: input.nodeID,
+      nodeName: input.nodeName,
+      workspaceRef: input.workspaceRef,
       success: true,
       result,
     })
@@ -1185,6 +1206,12 @@ async function* durableRunWorkflow(
     yield ctx.callActivity(durablePublishCompletionActivity, {
       workflowID: input.workflowID,
       parentExecutionID: input.parentExecutionID,
+      executionID: input.executionID,
+      dbExecutionID: input.dbExecutionID,
+      workflowDefinitionID: input.workflowDefinitionID,
+      nodeID: input.nodeID,
+      nodeName: input.nodeName,
+      workspaceRef: input.workspaceRef,
       success: false,
       error: message,
     })
@@ -1314,6 +1341,32 @@ export const DurableRoutes = lazy(() =>
         })
       },
     )
+    .get(
+      "/tools",
+      describeRoute({
+        summary: "List durable workspace tools",
+        operationId: "durable.tools",
+        responses: {
+          200: {
+            description: "available tools",
+            content: {
+              "application/json": {
+                schema: resolver(ToolsResponse),
+              },
+            },
+          },
+        },
+      }),
+      async (c) => {
+        return c.json({
+          success: true as const,
+          tools: workspaceTools.map((id) => ({
+            id,
+            description: workspaceToolDescriptions[id as WorkspaceTool],
+          })),
+        })
+      },
+    )
     .post(
       "/run",
       describeRoute({
@@ -1346,6 +1399,12 @@ export const DurableRoutes = lazy(() =>
           const workflowInput: DurableRunPayload = {
             workflowID: id,
             parentExecutionID: body.parentExecutionId?.trim() || "",
+            executionID: body.executionId?.trim() || "",
+            dbExecutionID: body.dbExecutionId?.trim() || "",
+            workflowDefinitionID: body.workflowId?.trim() || "",
+            nodeID: body.nodeId?.trim() || "",
+            nodeName: body.nodeName?.trim() || "",
+            workspaceRef: body.workspaceRef?.trim() || "",
             prompt,
             cwd: body.cwd?.trim() || Instance.directory,
             agent: body.agentConfig?.name?.trim() || "build",
@@ -1409,6 +1468,12 @@ export const DurableRoutes = lazy(() =>
           const workflowInput: DurableRunPayload = {
             workflowID: id,
             parentExecutionID: body.parentExecutionId?.trim() || "",
+            executionID: body.executionId?.trim() || "",
+            dbExecutionID: body.dbExecutionId?.trim() || "",
+            workflowDefinitionID: body.workflowId?.trim() || "",
+            nodeID: body.nodeId?.trim() || "",
+            nodeName: body.nodeName?.trim() || "",
+            workspaceRef: body.workspaceRef?.trim() || "",
             prompt,
             cwd: body.cwd?.trim() || Instance.directory,
             agent: body.agentConfig?.name?.trim() || "build",
