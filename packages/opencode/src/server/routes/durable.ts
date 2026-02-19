@@ -10,11 +10,13 @@ import { Provider } from "@/provider/provider"
 import { SessionPrompt } from "@/session/prompt"
 import { Session } from "@/session"
 import { MessageV2 } from "@/session/message-v2"
+import { ToolRegistry } from "@/tool/registry"
 import { Filesystem } from "@/util/filesystem"
 import { lazy } from "@/util/lazy"
 import { Log } from "@/util/log"
-import fs from "fs/promises"
 import path from "path"
+import { request as httpsRequest } from "node:https"
+import { existsSync, readFileSync } from "node:fs"
 
 const log = Log.create({ service: "server.durable" })
 const PLAN_OPEN = "<proposed_plan>"
@@ -35,6 +37,20 @@ const WORKSPACE_COMMAND_TIMEOUT_MS = Number.parseInt(process.env.WORKSPACE_COMMA
 const WORKSPACE_CLONE_TIMEOUT_MS = Number.parseInt(process.env.WORKSPACE_CLONE_TIMEOUT_MS ?? "120000", 10)
 const WORKSPACE_STRIP_CLONE_GIT_DIR = String(process.env.WORKSPACE_CLONE_STRIP_GIT_DIR ?? "true").toLowerCase() !== "false"
 const WORKSPACE_STORE_PATH = path.join(Global.Path.state, "durable-workspaces", "sessions.json")
+const WORKSPACE_SANDBOX_NAMESPACE = process.env.WORKSPACE_SANDBOX_NAMESPACE?.trim() || process.env.SANDBOX_NAMESPACE?.trim() || "agent-sandbox"
+const WORKSPACE_SANDBOX_TEMPLATE = process.env.WORKSPACE_SANDBOX_TEMPLATE?.trim() || process.env.SANDBOX_TEMPLATE?.trim() || "dapr-agent"
+const WORKSPACE_SANDBOX_PORT = Number.parseInt(process.env.WORKSPACE_SANDBOX_PORT ?? "8888", 10)
+const WORKSPACE_SANDBOX_ROOT = process.env.WORKSPACE_SANDBOX_ROOT?.trim() || process.env.WORKSPACE_SESSIONS_ROOT?.trim() || "/app/workspaces"
+const WORKSPACE_SANDBOX_PROVISION_TIMEOUT_MS = Number.parseInt(process.env.WORKSPACE_SANDBOX_PROVISION_TIMEOUT_MS ?? "180000", 10)
+const WORKSPACE_SANDBOX_REQUEST_TIMEOUT_MS = Number.parseInt(process.env.WORKSPACE_SANDBOX_REQUEST_TIMEOUT_MS ?? "30000", 10)
+const WORKSPACE_SANDBOX_HEARTBEAT_MS = Number.parseInt(process.env.WORKSPACE_SANDBOX_HEARTBEAT_MS ?? "30000", 10)
+const K8S_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+const K8S_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+const K8S_HOST = process.env.KUBERNETES_SERVICE_HOST || "kubernetes.default.svc"
+const K8S_PORT = Number.parseInt(process.env.KUBERNETES_SERVICE_PORT || "443", 10)
+const SANDBOX_CLAIM_API_GROUP = "extensions.agents.x-k8s.io"
+const SANDBOX_CLAIM_API_VERSION = "v1alpha1"
+const SANDBOX_CLAIM_PLURAL = "sandboxclaims"
 
 const AgentConfig = z
   .object({
@@ -161,13 +177,21 @@ const WorkspaceProfileResponse = z.object({
   name: z.string(),
   rootPath: z.string(),
   clonePath: z.string().optional(),
-  backend: z.literal("local"),
+  backend: z.literal("kubernetes"),
   enabledTools: z.array(WorkspaceToolName),
   requireReadBeforeWrite: z.boolean(),
   commandTimeoutMs: z.number().int().positive(),
   createdAt: z.string(),
   sandbox: z.object({
-    backend: z.literal("local"),
+    backend: z.literal("kubernetes"),
+    namespace: z.string(),
+    templateName: z.string(),
+    claimName: z.string(),
+    sandboxName: z.string().optional(),
+    podName: z.string().optional(),
+    podIP: z.string().optional(),
+    status: z.string().optional(),
+    service: z.string(),
     rootPath: z.string(),
     workingDirectory: z.string(),
     details: z.record(z.string(), z.any()),
@@ -247,13 +271,26 @@ type WorkflowStateLike = {
 
 type WorkspaceTool = z.infer<typeof WorkspaceToolName>
 
+type WorkspaceSandboxState = {
+  namespace: string
+  templateName: string
+  claimName: string
+  sandboxName?: string
+  podName?: string
+  podIP?: string
+  status?: string
+  service: string
+  lastHeartbeatAt?: number
+}
+
 type WorkspaceSessionRecord = {
   workspaceRef: string
   executionId: string
   name: string
   rootPath: string
   clonePath?: string
-  backend: "local"
+  backend: "kubernetes"
+  sandbox: WorkspaceSandboxState
   enabledTools: WorkspaceTool[]
   requireReadBeforeWrite: boolean
   commandTimeoutMs: number
@@ -297,24 +334,40 @@ const workspaceToolDescriptions: Record<WorkspaceTool, string> = {
   bash: "Run shell commands",
 }
 
-function workspaceBaseRoot() {
-  const configured = process.env.WORKSPACE_SESSIONS_ROOT?.trim()
-  if (!configured) return path.join(Global.Path.state, "durable-workspaces", "runs")
-  if (path.isAbsolute(configured)) return configured
-  return path.resolve(configured)
-}
-
 function sanitizeWorkspaceSegment(input: string) {
   return input.replace(/[^a-zA-Z0-9._-]/g, "-")
 }
 
+function normalizePosixPath(input: string) {
+  const value = input.replace(/\\/g, "/").trim() || "/"
+  const absolute = value.startsWith("/") ? value : `/${value}`
+  const normalized = path.posix.normalize(absolute)
+  return normalized === "." ? "/" : normalized
+}
+
+function containsPosixPath(root: string, target: string) {
+  const normalizedRoot = normalizePosixPath(root).replace(/\/+$/, "") || "/"
+  const normalizedTarget = normalizePosixPath(target)
+  if (normalizedRoot === "/") return normalizedTarget.startsWith("/")
+  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`)
+}
+
+function workspaceBaseRoot() {
+  return normalizePosixPath(WORKSPACE_SANDBOX_ROOT)
+}
+
 function parseWorkspaceBoolean(input: unknown) {
   if (typeof input === "boolean") return input
+  if (typeof input === "string") return input.trim().toLowerCase() === "true"
   return false
 }
 
 function parseWorkspaceTimeout(input: unknown) {
   if (typeof input === "number" && Number.isFinite(input) && input > 0) return Math.floor(input)
+  if (typeof input === "string") {
+    const parsed = Number.parseInt(input, 10)
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+  }
   return
 }
 
@@ -333,6 +386,87 @@ function parseWorkspaceEnabledTools(input: unknown): WorkspaceTool[] {
   }))]
 }
 
+class K8sRequestError extends Error {
+  statusCode: number
+  constructor(statusCode: number, message: string) {
+    super(message)
+    this.name = "K8sRequestError"
+    this.statusCode = statusCode
+  }
+}
+
+function readK8sToken() {
+  if (!existsSync(K8S_TOKEN_PATH)) {
+    throw new Error("kubernetes service account token not found")
+  }
+  return readFileSync(K8S_TOKEN_PATH, "utf-8").trim()
+}
+
+function readK8sCA() {
+  if (!existsSync(K8S_CA_PATH)) return
+  return readFileSync(K8S_CA_PATH)
+}
+
+async function k8sRequest<T>(method: string, requestPath: string, body?: unknown): Promise<T> {
+  const token = readK8sToken()
+  const ca = readK8sCA()
+  const payload = body === undefined ? undefined : JSON.stringify(body)
+  return await new Promise<T>((resolve, reject) => {
+    const req = httpsRequest(
+      {
+        hostname: K8S_HOST,
+        port: K8S_PORT,
+        path: requestPath,
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          ...(payload ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {}),
+        },
+        ca,
+        rejectUnauthorized: ca !== undefined,
+      },
+      (res) => {
+        let data = ""
+        res.on("data", (chunk: Buffer | string) => {
+          data += typeof chunk === "string" ? chunk : chunk.toString("utf-8")
+        })
+        res.on("end", () => {
+          const statusCode = res.statusCode ?? 500
+          let parsed: unknown = {}
+          if (data) {
+            try {
+              parsed = JSON.parse(data)
+            } catch {
+              parsed = { message: data }
+            }
+          }
+          if (statusCode >= 400) {
+            const message =
+              parsed && typeof parsed === "object" && typeof (parsed as Record<string, unknown>).message === "string"
+                ? ((parsed as Record<string, unknown>).message as string)
+                : data || `k8s request failed with status ${statusCode}`
+            reject(new K8sRequestError(statusCode, message))
+            return
+          }
+          resolve(parsed as T)
+        })
+      },
+    )
+    req.on("error", reject)
+    if (payload) req.write(payload)
+    req.end()
+  })
+}
+
+function isK8sRequestError(error: unknown): error is K8sRequestError {
+  return error instanceof K8sRequestError
+}
+
+function shellEscape(input: string) {
+  return `'${input.replace(/'/g, "'\\''")}'`
+}
+
 function workspaceRecord(session: WorkspaceSession): WorkspaceSessionRecord {
   return {
     workspaceRef: session.workspaceRef,
@@ -341,6 +475,7 @@ function workspaceRecord(session: WorkspaceSession): WorkspaceSessionRecord {
     rootPath: session.rootPath,
     clonePath: session.clonePath,
     backend: session.backend,
+    sandbox: session.sandbox,
     enabledTools: [...session.enabledTools],
     requireReadBeforeWrite: session.requireReadBeforeWrite,
     commandTimeoutMs: session.commandTimeoutMs,
@@ -353,10 +488,20 @@ function workspaceRecord(session: WorkspaceSession): WorkspaceSessionRecord {
 
 function workspaceSandbox(session: WorkspaceSession) {
   return {
-    backend: "local" as const,
+    backend: "kubernetes" as const,
+    namespace: session.sandbox.namespace,
+    templateName: session.sandbox.templateName,
+    claimName: session.sandbox.claimName,
+    sandboxName: session.sandbox.sandboxName,
+    podName: session.sandbox.podName,
+    podIP: session.sandbox.podIP,
+    status: session.sandbox.status,
+    service: session.sandbox.service,
     rootPath: session.rootPath,
     workingDirectory: session.clonePath ?? session.rootPath,
-    details: {},
+    details: {
+      heartbeatAt: session.sandbox.lastHeartbeatAt,
+    },
   }
 }
 
@@ -368,7 +513,7 @@ function workspaceProfile(session: WorkspaceSession) {
     name: session.name,
     rootPath: session.rootPath,
     clonePath: session.clonePath,
-    backend: "local" as const,
+    backend: "kubernetes" as const,
     enabledTools: [...session.enabledTools],
     requireReadBeforeWrite: session.requireReadBeforeWrite,
     commandTimeoutMs: session.commandTimeoutMs,
@@ -388,16 +533,54 @@ async function ensureWorkspaceStore() {
       }
       for (const record of file.sessions) {
         if (!record || typeof record !== "object") continue
+        if (record.backend !== "kubernetes") continue
         if (typeof record.workspaceRef !== "string" || !record.workspaceRef.trim()) continue
         if (typeof record.executionId !== "string" || !record.executionId.trim()) continue
         if (typeof record.rootPath !== "string" || !record.rootPath.trim()) continue
+        if (!record.sandbox || typeof record.sandbox !== "object") continue
+        if (typeof record.sandbox.claimName !== "string" || !record.sandbox.claimName.trim()) continue
         const session: WorkspaceSession = {
           workspaceRef: record.workspaceRef.trim(),
           executionId: record.executionId.trim(),
           name: typeof record.name === "string" && record.name.trim() ? record.name : `workspace-${record.executionId}`,
-          rootPath: record.rootPath.trim(),
-          clonePath: typeof record.clonePath === "string" && record.clonePath.trim() ? record.clonePath.trim() : undefined,
-          backend: "local",
+          rootPath: normalizePosixPath(record.rootPath.trim()),
+          clonePath: typeof record.clonePath === "string" && record.clonePath.trim() ? normalizePosixPath(record.clonePath.trim()) : undefined,
+          backend: "kubernetes",
+          sandbox: {
+            namespace:
+              typeof record.sandbox.namespace === "string" && record.sandbox.namespace.trim()
+                ? record.sandbox.namespace.trim()
+                : WORKSPACE_SANDBOX_NAMESPACE,
+            templateName:
+              typeof record.sandbox.templateName === "string" && record.sandbox.templateName.trim()
+                ? record.sandbox.templateName.trim()
+                : WORKSPACE_SANDBOX_TEMPLATE,
+            claimName: record.sandbox.claimName.trim(),
+            sandboxName:
+              typeof record.sandbox.sandboxName === "string" && record.sandbox.sandboxName.trim()
+                ? record.sandbox.sandboxName.trim()
+                : undefined,
+            podName:
+              typeof record.sandbox.podName === "string" && record.sandbox.podName.trim()
+                ? record.sandbox.podName.trim()
+                : undefined,
+            podIP:
+              typeof record.sandbox.podIP === "string" && record.sandbox.podIP.trim()
+                ? record.sandbox.podIP.trim()
+                : undefined,
+            status:
+              typeof record.sandbox.status === "string" && record.sandbox.status.trim()
+                ? record.sandbox.status.trim()
+                : undefined,
+            service:
+              typeof record.sandbox.service === "string" && record.sandbox.service.trim()
+                ? record.sandbox.service.trim()
+                : `http://sandbox.${WORKSPACE_SANDBOX_NAMESPACE}.svc.cluster.local:${WORKSPACE_SANDBOX_PORT}`,
+            lastHeartbeatAt:
+              typeof record.sandbox.lastHeartbeatAt === "number" && record.sandbox.lastHeartbeatAt > 0
+                ? record.sandbox.lastHeartbeatAt
+                : undefined,
+          },
           enabledTools: parseWorkspaceEnabledTools(record.enabledTools),
           requireReadBeforeWrite: Boolean(record.requireReadBeforeWrite),
           commandTimeoutMs:
@@ -414,9 +597,7 @@ async function ensureWorkspaceStore() {
         }
         workspaceSessions.set(session.workspaceRef, session)
         executionToWorkspace.set(session.executionId, session.workspaceRef)
-        if (session.durableInstanceId) {
-          durableToWorkspace.set(session.durableInstanceId, session.workspaceRef)
-        }
+        if (session.durableInstanceId) durableToWorkspace.set(session.durableInstanceId, session.workspaceRef)
       }
       workspaceStoreReady = true
     })().catch((error: unknown) => {
@@ -435,7 +616,7 @@ async function persistWorkspaceStore() {
     .catch(() => undefined)
     .then(async () => {
       await Filesystem.writeJson(WORKSPACE_STORE_PATH, {
-        version: 1,
+        version: 2,
         sessions: [...workspaceSessions.values()].map((session) => workspaceRecord(session)),
       })
     })
@@ -498,9 +679,366 @@ async function resolveWorkspaceFromInput(input: WorkspaceActionInput) {
 function resolveWorkspaceRoot(executionID: string, requested: string | undefined) {
   const base = workspaceBaseRoot()
   const value = requested?.trim()
-  if (!value) return path.resolve(base, sanitizeWorkspaceSegment(executionID))
-  if (path.isAbsolute(value)) return path.resolve(value)
-  return path.resolve(base, value)
+  if (!value) return normalizePosixPath(path.posix.join(base, sanitizeWorkspaceSegment(executionID)))
+  if (value.startsWith("/")) {
+    const resolved = normalizePosixPath(value)
+    if (!containsPosixPath(base, resolved)) {
+      throw new Error("rootPath must stay inside sandbox workspace root")
+    }
+    return resolved
+  }
+  const resolved = normalizePosixPath(path.posix.join(base, value))
+  if (!containsPosixPath(base, resolved)) {
+    throw new Error("rootPath must stay inside sandbox workspace root")
+  }
+  return resolved
+}
+
+async function sleep(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function sandboxClaimPath(namespace: string, claimName?: string) {
+  const base = `/apis/${SANDBOX_CLAIM_API_GROUP}/${SANDBOX_CLAIM_API_VERSION}/namespaces/${namespace}/${SANDBOX_CLAIM_PLURAL}`
+  if (!claimName) return base
+  return `${base}/${claimName}`
+}
+
+async function waitForSandboxName(namespace: string, claimName: string) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < WORKSPACE_SANDBOX_PROVISION_TIMEOUT_MS) {
+    const claim = await k8sRequest<Record<string, unknown>>("GET", sandboxClaimPath(namespace, claimName))
+    const status = claim.status as Record<string, unknown> | undefined
+    const sandboxStatus = status?.sandbox as Record<string, unknown> | undefined
+    const sandboxName = typeof sandboxStatus?.Name === "string" ? sandboxStatus.Name.trim() : ""
+    if (sandboxName) return sandboxName
+    const conditions = Array.isArray(status?.conditions) ? status.conditions : []
+    for (const condition of conditions) {
+      const value = condition as Record<string, unknown>
+      if (value.type === "Ready" && value.status === "False" && value.reason === "Failed") {
+        throw new Error(typeof value.message === "string" ? value.message : `sandbox claim ${claimName} failed`)
+      }
+    }
+    await sleep(1000)
+  }
+  throw new Error(`sandbox claim "${claimName}" not ready within timeout`)
+}
+
+async function getPodEndpointByName(namespace: string, podName: string) {
+  try {
+    const pod = await k8sRequest<Record<string, unknown>>("GET", `/api/v1/namespaces/${namespace}/pods/${podName}`)
+    const metadata = (pod.metadata ?? {}) as Record<string, unknown>
+    const status = (pod.status ?? {}) as Record<string, unknown>
+    const podIP = typeof status.podIP === "string" ? status.podIP.trim() : ""
+    const phase = typeof status.phase === "string" ? status.phase.trim() : ""
+    const resolvedPodName = typeof metadata.name === "string" ? metadata.name.trim() : podName
+    if (!podIP || phase !== "Running") return
+    return {
+      podName: resolvedPodName,
+      podIP,
+    }
+  } catch {
+    return
+  }
+}
+
+async function getPodEndpointBySelector(namespace: string, selector: string) {
+  try {
+    const listPath = `/api/v1/namespaces/${namespace}/pods?labelSelector=${encodeURIComponent(selector)}`
+    const podList = await k8sRequest<Record<string, unknown>>("GET", listPath)
+    const items = Array.isArray(podList.items) ? podList.items : []
+    for (const item of items) {
+      const pod = item as Record<string, unknown>
+      const metadata = (pod.metadata ?? {}) as Record<string, unknown>
+      const status = (pod.status ?? {}) as Record<string, unknown>
+      const podIP = typeof status.podIP === "string" ? status.podIP.trim() : ""
+      const phase = typeof status.phase === "string" ? status.phase.trim() : ""
+      const podName = typeof metadata.name === "string" ? metadata.name.trim() : ""
+      if (podIP && phase === "Running" && podName) {
+        return {
+          podName,
+          podIP,
+        }
+      }
+    }
+    return
+  } catch {
+    return
+  }
+}
+
+async function resolveSandboxPodEndpoint(namespace: string, sandboxName: string) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < WORKSPACE_SANDBOX_PROVISION_TIMEOUT_MS) {
+    try {
+      const sandboxPath = `/apis/agents.x-k8s.io/v1alpha1/namespaces/${namespace}/sandboxes/${sandboxName}`
+      const sandbox = await k8sRequest<Record<string, unknown>>("GET", sandboxPath)
+      const metadata = (sandbox.metadata ?? {}) as Record<string, unknown>
+      const annotations = (metadata.annotations ?? {}) as Record<string, unknown>
+      const status = (sandbox.status ?? {}) as Record<string, unknown>
+
+      const annotatedPod = typeof annotations["agents.x-k8s.io/pod-name"] === "string"
+        ? annotations["agents.x-k8s.io/pod-name"].trim()
+        : ""
+      if (annotatedPod) {
+        const endpoint = await getPodEndpointByName(namespace, annotatedPod)
+        if (endpoint) return endpoint
+      }
+
+      const selector = typeof status.selector === "string" ? status.selector.trim() : ""
+      if (selector) {
+        const endpoint = await getPodEndpointBySelector(namespace, selector)
+        if (endpoint) return endpoint
+      }
+
+      const fallback = await getPodEndpointByName(namespace, sandboxName)
+      if (fallback) return fallback
+    } catch {
+      // sandbox may not be available yet
+    }
+    await sleep(1000)
+  }
+  throw new Error(`unable to resolve pod endpoint for sandbox "${sandboxName}"`)
+}
+
+async function provisionWorkspaceSandbox(session: WorkspaceSession) {
+  try {
+    await k8sRequest("POST", sandboxClaimPath(session.sandbox.namespace), {
+      apiVersion: `${SANDBOX_CLAIM_API_GROUP}/${SANDBOX_CLAIM_API_VERSION}`,
+      kind: "SandboxClaim",
+      metadata: {
+        name: session.sandbox.claimName,
+        namespace: session.sandbox.namespace,
+        labels: {
+          "app.kubernetes.io/managed-by": "opencode-durable",
+          "opencode.ai/workspace-ref": session.workspaceRef,
+          "opencode.ai/execution-id": session.executionId,
+        },
+      },
+      spec: {
+        sandboxTemplateRef: {
+          name: session.sandbox.templateName,
+        },
+      },
+    })
+  } catch (error: unknown) {
+    if (!isK8sRequestError(error) || error.statusCode !== 409) throw error
+  }
+  session.sandbox.status = "provisioning"
+  const sandboxName = await waitForSandboxName(session.sandbox.namespace, session.sandbox.claimName)
+  const endpoint = await resolveSandboxPodEndpoint(session.sandbox.namespace, sandboxName)
+  session.sandbox.sandboxName = sandboxName
+  session.sandbox.podName = endpoint.podName
+  session.sandbox.podIP = endpoint.podIP
+  session.sandbox.status = "ready"
+  session.sandbox.lastHeartbeatAt = Date.now()
+}
+
+async function ensureWorkspaceSandbox(session: WorkspaceSession) {
+  const now = Date.now()
+  if (
+    session.sandbox.podIP &&
+    session.sandbox.sandboxName &&
+    session.sandbox.lastHeartbeatAt &&
+    now - session.sandbox.lastHeartbeatAt < WORKSPACE_SANDBOX_HEARTBEAT_MS
+  ) {
+    return
+  }
+  if (!session.sandbox.sandboxName) {
+    session.sandbox.sandboxName = await waitForSandboxName(session.sandbox.namespace, session.sandbox.claimName)
+  }
+  const endpoint = await resolveSandboxPodEndpoint(session.sandbox.namespace, session.sandbox.sandboxName)
+  session.sandbox.podName = endpoint.podName
+  session.sandbox.podIP = endpoint.podIP
+  session.sandbox.status = "ready"
+  session.sandbox.lastHeartbeatAt = now
+  await persistWorkspaceStore()
+}
+
+async function executeSandboxCommand(input: {
+  session: WorkspaceSession
+  command: string
+  cwd: string
+  timeoutMs: number
+}) {
+  await ensureWorkspaceSandbox(input.session)
+  if (!input.session.sandbox.podIP) {
+    throw new Error(`workspace sandbox pod IP is not available for ${input.session.workspaceRef}`)
+  }
+  const startedAt = Date.now()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), input.timeoutMs)
+  try {
+    const wrapped = `cd ${shellEscape(input.cwd)} && ${input.command}`
+    const response = await fetch(`http://${input.session.sandbox.podIP}:${WORKSPACE_SANDBOX_PORT}/execute`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        command: wrapped,
+        timeout: input.timeoutMs,
+      }),
+      signal: controller.signal,
+    })
+    const elapsed = Date.now() - startedAt
+    if (!response.ok) {
+      const details = await response.text().catch(() => "")
+      throw new Error(`sandbox /execute failed (${response.status}): ${details || "unknown error"}`)
+    }
+    const result = (await response.json()) as Record<string, unknown>
+    const exitCode = typeof result.exit_code === "number" ? result.exit_code : 1
+    return {
+      stdout: typeof result.stdout === "string" ? result.stdout : "",
+      stderr: typeof result.stderr === "string" ? result.stderr : "",
+      exitCode,
+      success: exitCode === 0,
+      executionTimeMs: elapsed,
+      timedOut: false as boolean | undefined,
+    }
+  } catch (error: unknown) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return {
+        stdout: "",
+        stderr: "command timed out",
+        exitCode: 124,
+        success: false,
+        executionTimeMs: Date.now() - startedAt,
+        timedOut: true as boolean | undefined,
+      }
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function resolveCloneTargetDir(repo: string, targetDir: string | undefined) {
+  const candidate = (targetDir?.trim() || repo.trim()).replace(/\\/g, "/")
+  if (!candidate) throw new Error("targetDir could not be resolved")
+  const normalized = path.posix.normalize(candidate)
+  if (!normalized || normalized === "." || normalized.startsWith("..") || normalized.startsWith("/")) {
+    throw new Error("targetDir must be a relative path inside workspace root")
+  }
+  return normalized.replace(/^\.\/+/, "")
+}
+
+function resolveWorkspacePath(session: WorkspaceSession, value: string | undefined, operation: string) {
+  const input = value?.trim() || ""
+  if (!input) throw new Error(`path is required for ${operation}`)
+  const full = normalizePosixPath(path.posix.resolve(session.rootPath, input))
+  if (!containsPosixPath(session.rootPath, full)) {
+    throw new Error(`path "${input}" escapes workspace root`)
+  }
+  return full
+}
+
+function assertCloneScope(session: WorkspaceSession, fullPath: string, operation: string) {
+  if (!session.clonePath) return
+  if (fullPath === session.clonePath) return
+  if (containsPosixPath(session.clonePath, fullPath)) return
+  throw new Error(`${operation} path is outside clone root "${session.clonePath}"`)
+}
+
+async function sandboxPathExists(session: WorkspaceSession, fullPath: string) {
+  const result = await executeSandboxCommand({
+    session,
+    command: `test -e ${shellEscape(fullPath)}`,
+    cwd: session.rootPath,
+    timeoutMs: Math.min(session.commandTimeoutMs, 15000),
+  })
+  return result.success
+}
+
+async function enforceReadBeforeWrite(session: WorkspaceSession, fullPath: string) {
+  if (!session.requireReadBeforeWrite) return
+  if (!(await sandboxPathExists(session, fullPath))) return
+  if (session.readPaths.has(fullPath)) return
+  throw new Error(`Write blocked by read-before-write policy for "${fullPath}" in workspace ${session.workspaceRef}`)
+}
+
+function mapWorkspacePathError(stderr: string, fullPath: string) {
+  const value = stderr.toLowerCase()
+  if (value.includes("no such file")) return `path not found: ${fullPath}`
+  if (value.includes("is a directory")) return `path is a directory: ${fullPath}`
+  if (value.includes("permission denied")) return `permission denied: ${fullPath}`
+  return stderr || `operation failed for ${fullPath}`
+}
+
+async function readWorkspaceFile(session: WorkspaceSession, fullPath: string) {
+  await ensureWorkspaceSandbox(session)
+  if (!session.sandbox.podIP) throw new Error("workspace sandbox pod is not ready")
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), Math.min(session.commandTimeoutMs, WORKSPACE_SANDBOX_REQUEST_TIMEOUT_MS))
+  try {
+    const response = await fetch(
+      `http://${session.sandbox.podIP}:${WORKSPACE_SANDBOX_PORT}/download/${encodeURIComponent(fullPath)}`,
+      { signal: controller.signal },
+    )
+    if (response.ok) {
+      return await response.text()
+    }
+    if (response.status === 404) throw new Error(`path not found: ${fullPath}`)
+    const fallback = await executeSandboxCommand({
+      session,
+      command: [
+        `if [ ! -e ${shellEscape(fullPath)} ]; then`,
+        'echo "No such file or directory" 1>&2;',
+        "exit 2;",
+        "fi;",
+        `if [ -d ${shellEscape(fullPath)} ]; then`,
+        'echo "Is a directory" 1>&2;',
+        "exit 21;",
+        "fi;",
+        `base64 ${shellEscape(fullPath)} | tr -d '\\n'`,
+      ].join(" "),
+      cwd: session.rootPath,
+      timeoutMs: session.commandTimeoutMs,
+    })
+    if (!fallback.success) throw new Error(mapWorkspacePathError(fallback.stderr, fullPath))
+    return Buffer.from(fallback.stdout.trim(), "base64").toString("utf-8")
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function writeWorkspaceFile(session: WorkspaceSession, fullPath: string, content: string) {
+  const parent = normalizePosixPath(path.posix.dirname(fullPath))
+  const mkdir = await executeSandboxCommand({
+    session,
+    command: `mkdir -p ${shellEscape(parent)}`,
+    cwd: session.rootPath,
+    timeoutMs: session.commandTimeoutMs,
+  })
+  if (!mkdir.success) throw new Error(mkdir.stderr || `failed creating parent directory for ${fullPath}`)
+  const encoded = Buffer.from(content, "utf-8").toString("base64")
+  const write = await executeSandboxCommand({
+    session,
+    command: `printf %s ${shellEscape(encoded)} | base64 -d > ${shellEscape(fullPath)}`,
+    cwd: session.rootPath,
+    timeoutMs: session.commandTimeoutMs,
+  })
+  if (!write.success) throw new Error(mapWorkspacePathError(write.stderr, fullPath))
+}
+
+async function listWorkspacePath(session: WorkspaceSession, fullPath: string) {
+  const result = await executeSandboxCommand({
+    session,
+    command: `find ${shellEscape(fullPath)} -maxdepth 1 -mindepth 1 -exec stat --format='%n\\t%F' {} \\;`,
+    cwd: session.rootPath,
+    timeoutMs: session.commandTimeoutMs,
+  })
+  if (!result.success) throw new Error(mapWorkspacePathError(result.stderr, fullPath))
+  return result.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [target, kind] = line.split("\t")
+      const name = target ? path.posix.basename(target) : ""
+      return {
+        name,
+        type: kind?.includes("directory") ? "directory" : "file",
+      }
+    })
 }
 
 async function createOrGetWorkspaceProfile(input: z.infer<typeof WorkspaceProfileInput>) {
@@ -517,16 +1055,22 @@ async function createOrGetWorkspaceProfile(input: z.infer<typeof WorkspaceProfil
     }
     executionToWorkspace.delete(executionID)
   }
-  const rootPath = resolveWorkspaceRoot(executionID, input.rootPath)
-  await fs.mkdir(rootPath, { recursive: true })
+  const workspaceRef = `ws_${rid("session").replace(/^session-/, "")}`
   const now = Date.now()
   const session: WorkspaceSession = {
-    workspaceRef: `ws_${rid("session").replace(/^session-/, "")}`,
+    workspaceRef,
     executionId: executionID,
     name: input.name?.trim() || `workspace-${executionID}`,
-    rootPath,
+    rootPath: resolveWorkspaceRoot(executionID, input.rootPath),
     clonePath: undefined,
-    backend: "local",
+    backend: "kubernetes",
+    sandbox: {
+      namespace: WORKSPACE_SANDBOX_NAMESPACE,
+      templateName: WORKSPACE_SANDBOX_TEMPLATE,
+      claimName: `opencode-${sanitizeWorkspaceSegment(rid("claim").replace("claim-", ""))}`.slice(0, 63),
+      service: `http://sandbox.${WORKSPACE_SANDBOX_NAMESPACE}.svc.cluster.local:${WORKSPACE_SANDBOX_PORT}`,
+      status: "creating",
+    },
     enabledTools: parseWorkspaceEnabledTools(input.enabledTools),
     requireReadBeforeWrite: parseWorkspaceBoolean(input.requireReadBeforeWrite),
     commandTimeoutMs: parseWorkspaceTimeout(input.commandTimeoutMs) ?? WORKSPACE_COMMAND_TIMEOUT_MS,
@@ -537,87 +1081,34 @@ async function createOrGetWorkspaceProfile(input: z.infer<typeof WorkspaceProfil
   }
   workspaceSessions.set(session.workspaceRef, session)
   executionToWorkspace.set(executionID, session.workspaceRef)
-  await persistWorkspaceStore()
-  return session
+  try {
+    await provisionWorkspaceSandbox(session)
+    const mkdir = await executeSandboxCommand({
+      session,
+      command: `mkdir -p ${shellEscape(session.rootPath)}`,
+      cwd: "/",
+      timeoutMs: session.commandTimeoutMs,
+    })
+    if (!mkdir.success) {
+      throw new Error(mkdir.stderr || `failed creating workspace root ${session.rootPath}`)
+    }
+    await persistWorkspaceStore()
+    return session
+  } catch (error) {
+    try {
+      await k8sRequest("DELETE", sandboxClaimPath(session.sandbox.namespace, session.sandbox.claimName))
+    } catch {
+      // best effort cleanup
+    }
+    workspaceSessions.delete(session.workspaceRef)
+    executionToWorkspace.delete(executionID)
+    throw error
+  }
 }
 
 function assertWorkspaceTool(session: WorkspaceSession, tool: WorkspaceTool) {
   if (session.enabledTools.includes(tool)) return
   throw new Error(`Tool "${tool}" is disabled for workspace ${session.workspaceRef}`)
-}
-
-function resolveCloneTargetDir(repo: string, targetDir: string | undefined) {
-  const candidate = (targetDir?.trim() || repo.trim()).replace(/\\/g, "/")
-  if (!candidate) throw new Error("targetDir could not be resolved")
-  const normalized = path.posix.normalize(candidate)
-  if (!normalized || normalized === "." || normalized.startsWith("..") || normalized.startsWith("/")) {
-    throw new Error("targetDir must be a relative path inside workspace root")
-  }
-  return normalized.replace(/^\.\/+/, "")
-}
-
-async function runProcess(input: { cmd: string[]; cwd: string; timeoutMs: number; env?: Record<string, string> }) {
-  const startedAt = Date.now()
-  const proc = Bun.spawn(input.cmd, {
-    cwd: input.cwd,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: input.env ? { ...process.env, ...input.env } : process.env,
-  })
-  let timedOut = false
-  const timer = setTimeout(() => {
-    timedOut = true
-    try {
-      proc.kill()
-    } catch {}
-  }, input.timeoutMs)
-  const [exitCode, stdout, stderr] = await Promise.all([
-    proc.exited.catch(() => 1),
-    proc.stdout ? new Response(proc.stdout).text() : Promise.resolve(""),
-    proc.stderr ? new Response(proc.stderr).text() : Promise.resolve(""),
-  ])
-  clearTimeout(timer)
-  return {
-    stdout,
-    stderr,
-    exitCode,
-    success: exitCode === 0 && !timedOut,
-    executionTimeMs: Date.now() - startedAt,
-    timedOut: timedOut || undefined,
-  }
-}
-
-async function runShell(command: string, cwd: string, timeoutMs: number) {
-  return await runProcess({
-    cmd: ["sh", "-lc", command],
-    cwd,
-    timeoutMs,
-  })
-}
-
-function resolveWorkspacePath(session: WorkspaceSession, value: string | undefined, operation: string) {
-  const input = value?.trim() || ""
-  if (!input) throw new Error(`path is required for ${operation}`)
-  const full = path.resolve(session.rootPath, input)
-  if (!Filesystem.contains(session.rootPath, full)) {
-    throw new Error(`path "${input}" escapes workspace root`)
-  }
-  return full
-}
-
-function assertCloneScope(session: WorkspaceSession, fullPath: string, operation: string) {
-  if (!session.clonePath) return
-  if (fullPath === session.clonePath) return
-  if (Filesystem.contains(session.clonePath, fullPath)) return
-  throw new Error(`${operation} path is outside clone root "${session.clonePath}"`)
-}
-
-async function enforceReadBeforeWrite(session: WorkspaceSession, fullPath: string) {
-  if (!session.requireReadBeforeWrite) return
-  if (!(await Filesystem.exists(fullPath))) return
-  if (session.readPaths.has(fullPath)) return
-  throw new Error(`Write blocked by read-before-write policy for "${fullPath}" in workspace ${session.workspaceRef}`)
 }
 
 async function runWorkspaceClone(input: z.infer<typeof WorkspaceCloneInput>) {
@@ -632,25 +1123,33 @@ async function runWorkspaceClone(input: z.infer<typeof WorkspaceCloneInput>) {
   const branch = input.repositoryBranch?.trim() || "main"
   const timeoutMs = parseWorkspaceTimeout(input.timeoutMs) ?? Math.max(session.commandTimeoutMs, WORKSPACE_CLONE_TIMEOUT_MS)
   const cloneDir = resolveCloneTargetDir(repositoryRepo, input.targetDir)
-  const clonePath = path.resolve(session.rootPath, cloneDir)
-  if (!Filesystem.contains(session.rootPath, clonePath)) {
+  const clonePath = normalizePosixPath(path.posix.resolve(session.rootPath, cloneDir))
+  if (!containsPosixPath(session.rootPath, clonePath)) {
     throw new Error("targetDir must stay inside workspace root")
   }
-  await fs.rm(clonePath, { recursive: true, force: true })
   const token = input.repositoryToken?.trim() || input.githubToken?.trim() || ""
   const repositoryURL = token
     ? `https://${token}@github.com/${repositoryOwner}/${repositoryRepo}.git`
     : `https://github.com/${repositoryOwner}/${repositoryRepo}.git`
-  const gitCheck = await runProcess({
-    cmd: ["git", "--version"],
+
+  const gitCheck = await executeSandboxCommand({
+    session,
+    command: "git --version",
     cwd: session.rootPath,
     timeoutMs: Math.min(timeoutMs, 15000),
   })
-  if (!gitCheck.success) {
-    throw new Error("git is not installed in the durable agent runtime")
-  }
-  const clone = await runProcess({
-    cmd: ["git", "clone", "--depth", "1", "--branch", branch, repositoryURL, cloneDir],
+  if (!gitCheck.success) throw new Error("git is not installed in the workspace sandbox")
+
+  await executeSandboxCommand({
+    session,
+    command: `rm -rf ${shellEscape(clonePath)}`,
+    cwd: session.rootPath,
+    timeoutMs: Math.min(timeoutMs, 30000),
+  })
+
+  const clone = await executeSandboxCommand({
+    session,
+    command: `git clone --depth 1 --branch ${shellEscape(branch)} ${shellEscape(repositoryURL)} ${shellEscape(cloneDir)}`,
     cwd: session.rootPath,
     timeoutMs,
   })
@@ -658,14 +1157,18 @@ async function runWorkspaceClone(input: z.infer<typeof WorkspaceCloneInput>) {
     const sanitized = token ? clone.stderr.replaceAll(token, "***") : clone.stderr
     throw new Error(`git clone failed: ${sanitized || "unknown clone error"}`)
   }
-  const rev = await runProcess({
-    cmd: ["git", "rev-parse", "HEAD"],
+
+  const rev = await executeSandboxCommand({
+    session,
+    command: "git rev-parse HEAD",
     cwd: clonePath,
     timeoutMs: Math.min(timeoutMs, 30000),
   })
   const commitHash = rev.success ? rev.stdout.trim() || "unknown" : "unknown"
-  const files = await runProcess({
-    cmd: ["git", "ls-files", "--cached"],
+
+  const files = await executeSandboxCommand({
+    session,
+    command: "git ls-files --cached",
     cwd: clonePath,
     timeoutMs: Math.min(timeoutMs, 30000),
   })
@@ -675,11 +1178,18 @@ async function runWorkspaceClone(input: z.infer<typeof WorkspaceCloneInput>) {
         .map((line) => line.trim())
         .filter(Boolean).length
     : 0
+
   let strippedGitDir = false
   if (WORKSPACE_STRIP_CLONE_GIT_DIR) {
-    await fs.rm(path.join(clonePath, ".git"), { recursive: true, force: true })
-    strippedGitDir = true
+    const strip = await executeSandboxCommand({
+      session,
+      command: "rm -rf .git",
+      cwd: clonePath,
+      timeoutMs: Math.min(timeoutMs, 15000),
+    })
+    strippedGitDir = strip.success
   }
+
   session.clonePath = clonePath
   touchWorkspace(session)
   await persistWorkspaceStore()
@@ -703,7 +1213,12 @@ async function runWorkspaceCommand(input: z.infer<typeof WorkspaceCommandInput>)
   if (!command) throw new Error("command is required")
   const timeoutMs = parseWorkspaceTimeout(input.timeoutMs) ?? session.commandTimeoutMs
   const cwd = session.clonePath ?? session.rootPath
-  const result = await runShell(command, cwd, timeoutMs)
+  const result = await executeSandboxCommand({
+    session,
+    command,
+    cwd,
+    timeoutMs,
+  })
   touchWorkspace(session)
   await persistWorkspaceStore()
   return {
@@ -727,18 +1242,14 @@ async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInpu
   const session = await resolveWorkspaceFromInput(input)
   const operation = input.operation
   if (!isWorkspaceFileOperation(operation)) {
-    throw new Error(
-      "operation must be one of read, write, edit, list",
-    )
+    throw new Error("operation must be one of read, write, edit, list")
   }
   assertWorkspaceTool(session, workspaceToolForOperation(operation))
   await bindWorkspaceDurableInstance(session, parseDurableInstanceID(input))
 
   if (operation === "read") {
     const fullPath = resolveWorkspacePath(session, input.path, operation)
-    const file = Bun.file(fullPath)
-    if (!(await file.exists())) throw new Error(`path not found: ${input.path}`)
-    const content = await file.text()
+    const content = await readWorkspaceFile(session, fullPath)
     session.readPaths.add(fullPath)
     touchWorkspace(session)
     await persistWorkspaceStore()
@@ -749,7 +1260,7 @@ async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInpu
     const fullPath = resolveWorkspacePath(session, input.path, operation)
     assertCloneScope(session, fullPath, operation)
     await enforceReadBeforeWrite(session, fullPath)
-    await Filesystem.write(fullPath, input.content ?? "")
+    await writeWorkspaceFile(session, fullPath, input.content ?? "")
     touchWorkspace(session)
     await persistWorkspaceStore()
     return { path: input.path ?? "" }
@@ -761,28 +1272,21 @@ async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInpu
     await enforceReadBeforeWrite(session, fullPath)
     const oldString = input.old_string ?? ""
     if (!oldString) throw new Error("old_string is required for edit")
-    const file = Bun.file(fullPath)
-    if (!(await file.exists())) throw new Error(`path not found: ${input.path}`)
-    const current = await file.text()
+    const current = await readWorkspaceFile(session, fullPath)
     if (!current.includes(oldString)) throw new Error(`old_string not found in ${input.path}`)
-    await Filesystem.write(fullPath, current.replace(oldString, input.new_string ?? ""))
+    await writeWorkspaceFile(session, fullPath, current.replace(oldString, input.new_string ?? ""))
     touchWorkspace(session)
     await persistWorkspaceStore()
     return { path: input.path ?? "" }
   }
 
   if (operation === "list") {
-    const fullPath = path.resolve(session.rootPath, input.path?.trim() || ".")
-    if (!Filesystem.contains(session.rootPath, fullPath)) throw new Error(`path "${input.path}" escapes workspace root`)
-    const entries = await fs.readdir(fullPath, { withFileTypes: true })
+    const fullPath = normalizePosixPath(path.posix.resolve(session.rootPath, input.path?.trim() || "."))
+    if (!containsPosixPath(session.rootPath, fullPath)) throw new Error(`path "${input.path}" escapes workspace root`)
+    const files = await listWorkspacePath(session, fullPath)
     touchWorkspace(session)
     await persistWorkspaceStore()
-    return {
-      files: entries.map((entry) => ({
-        name: entry.name,
-        type: entry.isDirectory() ? "directory" : "file",
-      })),
-    }
+    return { files }
   }
 
   throw new Error("operation must be one of read, write, edit, list")
@@ -796,19 +1300,17 @@ async function cleanupWorkspaceRef(workspaceRef: string) {
   if (!session) return false
   workspaceSessions.delete(ref)
   executionToWorkspace.delete(session.executionId)
-  if (session.durableInstanceId) {
-    durableToWorkspace.delete(session.durableInstanceId)
-  }
-  const rootPath = path.resolve(session.rootPath)
-  const safeRoot = path.resolve(workspaceBaseRoot())
-  if (Filesystem.contains(safeRoot, rootPath)) {
-    await fs.rm(rootPath, { recursive: true, force: true }).catch(() => undefined)
-  } else {
-    log.warn("skipping workspace root deletion outside durable root", {
-      workspaceRef: ref,
-      rootPath,
-      safeRoot,
-    })
+  if (session.durableInstanceId) durableToWorkspace.delete(session.durableInstanceId)
+  try {
+    await k8sRequest("DELETE", sandboxClaimPath(session.sandbox.namespace, session.sandbox.claimName))
+  } catch (error: unknown) {
+    if (!isK8sRequestError(error) || error.statusCode !== 404) {
+      log.warn("failed deleting sandbox claim", {
+        workspaceRef: ref,
+        claimName: session.sandbox.claimName,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
   await persistWorkspaceStore()
   return true
@@ -819,16 +1321,14 @@ async function cleanupWorkspaceInput(input: z.infer<typeof CleanupInput>) {
   const refs = new Set<string>()
   const workspaceRef = input.workspaceRef?.trim() || ""
   const executionId = input.executionId?.trim() || ""
-  if (!workspaceRef && !executionId) {
-    throw new Error("workspaceRef or executionId is required")
-  }
+  if (!workspaceRef && !executionId) throw new Error("workspaceRef or executionId is required")
   if (workspaceRef) refs.add(workspaceRef)
   if (executionId) {
     const ref = executionToWorkspace.get(executionId)
     if (ref) refs.add(ref)
   }
   if (!refs.size) return []
-  const cleanedWorkspaceRefs = (
+  return (
     await Promise.all(
       [...refs].map(async (ref) => {
         if (!(await cleanupWorkspaceRef(ref))) return
@@ -836,7 +1336,6 @@ async function cleanupWorkspaceInput(input: z.infer<typeof CleanupInput>) {
       }),
     )
   ).filter((value): value is string => Boolean(value))
-  return cleanedWorkspaceRefs
 }
 
 async function sweepWorkspaceSessions() {
@@ -886,22 +1385,89 @@ function parseTools(input: z.infer<typeof RunInput>): Record<string, boolean> | 
   return input.tools
 }
 
-function parseModel(input: z.infer<typeof RunInput>) {
-  const model = (input.agentConfig?.modelSpec ?? input.model)?.trim()
-  if (!model) return undefined
-  const normalized = model.toLowerCase()
-  if (normalized === "anthropic/claude-opus-4-6" || normalized === "anthropic/claude-opus-4.6") {
-    const anthropicKey = process.env.ANTHROPIC_API_KEY?.trim()
-    if (anthropicKey) return Provider.parseModel("anthropic/claude-opus-4-6")
-    const fallbackModel = process.env.OPENAI_CHAT_FALLBACK_MODEL?.trim() || "gpt-4o"
-    const fallback = `openai/${fallbackModel}`
-    log.warn("anthropic model unavailable, falling back to configured openai model", {
-      requested: model,
-      fallback,
-    })
-    return Provider.parseModel(fallback)
+async function resolveTools(input: z.infer<typeof RunInput>) {
+  const parsed = parseTools(input)
+  if (!parsed) return undefined
+  const available = new Set(await ToolRegistry.ids())
+  const unknown = Object.keys(parsed).filter((tool) => !available.has(tool))
+  if (unknown.length > 0) {
+    throw new Error(`invalid tools: ${unknown.join(", ")}`)
   }
-  return Provider.parseModel(model)
+  return parsed
+}
+
+const opus46Aliases = new Set([
+  "anthropic/claude-opus-4-6",
+  "anthropic/claude-opus-4.6",
+  "claude-opus-4-6",
+  "claude-opus-4.6",
+  "anthropicclaudeopus4.6",
+  "anthropicclaudeopus4-6",
+])
+
+const opusModelPreferences = [
+  "claude-opus-4-6",
+  "claude-opus-4.6",
+  "claude-opus-4-5",
+  "claude-opus-4.5",
+  "claude-opus-4-1",
+  "claude-opus-4.1",
+  "claude-opus-4",
+]
+
+function normalizeModelInput(input: string) {
+  const trimmed = input.trim()
+  if (!trimmed) return ""
+  const compact = trimmed.replace(/\s+/g, "").toLowerCase()
+  if (compact.includes("claude") && compact.includes("opus") && compact.includes("4.6")) {
+    return "anthropic/claude-opus-4.6"
+  }
+  return trimmed.toLowerCase()
+}
+
+async function resolveOpusModel(): Promise<ModelRef> {
+  const provider = await Provider.getProvider("anthropic")
+  if (!provider) {
+    throw new Error("invalid model: anthropic provider is not configured")
+  }
+  for (const modelID of opusModelPreferences) {
+    if (provider.models[modelID]) return { providerID: "anthropic", modelID }
+  }
+  const candidates = Object.keys(provider.models).filter((modelID) => modelID.includes("claude-opus-4"))
+  if (candidates.length > 0) return { providerID: "anthropic", modelID: candidates[0]! }
+  throw new Error("invalid model: anthropic provider has no claude opus model available")
+}
+
+async function resolveModel(input: z.infer<typeof RunInput>) {
+  const raw = (input.agentConfig?.modelSpec ?? input.model)?.trim()
+  if (!raw) return undefined
+  const normalized = normalizeModelInput(raw)
+  if (opus46Aliases.has(normalized)) {
+    const resolved = await resolveOpusModel()
+    log.info("resolved claude opus model alias", {
+      requested: raw,
+      resolved: `${resolved.providerID}/${resolved.modelID}`,
+    })
+    return resolved
+  }
+  const parsed = Provider.parseModel(raw)
+  try {
+    await Provider.getModel(parsed.providerID, parsed.modelID)
+    return parsed
+  } catch (error: unknown) {
+    if (Provider.ModelNotFoundError.isInstance(error)) {
+      const suggestions =
+        error.data.suggestions && error.data.suggestions.length > 0
+          ? ` Suggestions: ${error.data.suggestions.join(", ")}`
+          : ""
+      throw new Error(`invalid model: ${raw}.${suggestions}`)
+    }
+    throw error
+  }
+}
+
+function isInputValidationError(message: string) {
+  return message.startsWith("invalid model:") || message.startsWith("invalid tools:")
 }
 
 function extractProposedPlanText(text: string): string | undefined {
@@ -1421,8 +1987,8 @@ export const DurableRoutes = lazy(() =>
             prompt,
             cwd: body.cwd?.trim() || Instance.directory,
             agent: body.agentConfig?.name?.trim() || "build",
-            model: parseModel(body),
-            tools: parseTools(body),
+            model: await resolveModel(body),
+            tools: await resolveTools(body),
             instructions: body.agentConfig?.instructions ?? body.instructions ?? undefined,
           }
           const instanceID = await withWorkflowClient((client) =>
@@ -1435,10 +2001,10 @@ export const DurableRoutes = lazy(() =>
           })
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error)
-          c.status(503)
+          c.status(isInputValidationError(message) ? 400 : 503)
           return c.json({
             success: false,
-            error: `durable runtime unavailable: ${message}`,
+            error: isInputValidationError(message) ? message : `durable runtime unavailable: ${message}`,
           })
         }
       },
@@ -1490,8 +2056,8 @@ export const DurableRoutes = lazy(() =>
             prompt,
             cwd: body.cwd?.trim() || Instance.directory,
             agent: body.agentConfig?.name?.trim() || "build",
-            model: parseModel(body),
-            tools: parseTools(body),
+            model: await resolveModel(body),
+            tools: await resolveTools(body),
             instructions: body.agentConfig?.instructions ?? body.instructions ?? undefined,
           }
           const instanceID = await withWorkflowClient((client) =>
@@ -1504,10 +2070,10 @@ export const DurableRoutes = lazy(() =>
           })
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error)
-          c.status(503)
+          c.status(isInputValidationError(message) ? 400 : 503)
           return c.json({
             success: false,
-            error: `durable runtime unavailable: ${message}`,
+            error: isInputValidationError(message) ? message : `durable runtime unavailable: ${message}`,
           })
         }
       },
@@ -1548,8 +2114,8 @@ export const DurableRoutes = lazy(() =>
             prompt,
             cwd: body.cwd?.trim() || Instance.directory,
             agent: body.agentConfig?.name?.trim() || "plan",
-            model: parseModel(body),
-            tools: parseTools(body),
+            model: await resolveModel(body),
+            tools: await resolveTools(body),
             instructions: body.agentConfig?.instructions ?? body.instructions ?? undefined,
           }
           const state = await withWorkflowClient(async (client) => {
@@ -1589,10 +2155,10 @@ export const DurableRoutes = lazy(() =>
           return c.json(output as z.infer<typeof PlanResponse>)
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error)
-          c.status(503)
+          c.status(isInputValidationError(message) ? 400 : 503)
           return c.json({
             success: false,
-            error: `durable runtime unavailable: ${message}`,
+            error: isInputValidationError(message) ? message : `durable runtime unavailable: ${message}`,
           })
         }
       },
