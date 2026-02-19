@@ -119,9 +119,9 @@ const WorkspaceProfileInput = z.object({
   executionId: z.string().optional(),
   name: z.string().optional(),
   rootPath: z.string().optional(),
-  enabledTools: z.array(WorkspaceToolName).optional(),
-  requireReadBeforeWrite: z.boolean().optional(),
-  commandTimeoutMs: z.number().int().positive().optional(),
+  enabledTools: z.union([z.array(WorkspaceToolName), z.string()]).optional(),
+  requireReadBeforeWrite: z.union([z.boolean(), z.string()]).optional(),
+  commandTimeoutMs: z.union([z.number().int().positive(), z.string()]).optional(),
 })
 
 const WorkspaceCloneInput = z.object({
@@ -134,7 +134,7 @@ const WorkspaceCloneInput = z.object({
   targetDir: z.string().optional(),
   repositoryToken: z.string().optional(),
   githubToken: z.string().optional(),
-  timeoutMs: z.number().int().positive().optional(),
+  timeoutMs: z.union([z.number().int().positive(), z.string()]).optional(),
 })
 
 const WorkspaceCommandInput = z.object({
@@ -142,7 +142,7 @@ const WorkspaceCommandInput = z.object({
   executionId: z.string().optional(),
   durableInstanceId: z.string().optional(),
   command: z.string().optional(),
-  timeoutMs: z.number().int().positive().optional(),
+  timeoutMs: z.union([z.number().int().positive(), z.string()]).optional(),
 })
 
 const WorkspaceFileOperationName = z.enum(["read", "write", "edit", "list"])
@@ -373,8 +373,25 @@ function parseWorkspaceTimeout(input: unknown) {
 
 function parseWorkspaceEnabledTools(input: unknown): WorkspaceTool[] {
   if (typeof input === "undefined") return [...workspaceTools]
-  if (!Array.isArray(input)) throw new Error("enabledTools must be an array of read, write, edit, list, bash")
-  return [...new Set(input.map((item) => {
+  const parsed = Array.isArray(input)
+    ? input
+    : typeof input === "string"
+      ? (() => {
+          const trimmed = input.trim()
+          if (!trimmed) return []
+          if (trimmed.startsWith("[")) {
+            try {
+              const decoded = JSON.parse(trimmed) as unknown
+              if (Array.isArray(decoded)) return decoded
+            } catch {
+              // fall through to csv parsing
+            }
+          }
+          return trimmed.split(",").map((item) => item.trim()).filter(Boolean)
+        })()
+      : undefined
+  if (!parsed) throw new Error("enabledTools must be an array of read, write, edit, list, bash")
+  return [...new Set(parsed.map((item) => {
     if (typeof item !== "string") {
       throw new Error("enabledTools must be an array of read, write, edit, list, bash")
     }
