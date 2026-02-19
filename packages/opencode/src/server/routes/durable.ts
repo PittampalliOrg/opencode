@@ -48,23 +48,23 @@ const AgentConfig = z
   .partial()
 
 const RunInput = z.object({
-  prompt: z.string().optional(),
-  model: z.string().optional(),
-  tools: z.union([z.array(z.string()), z.record(z.string(), z.boolean()), z.string()]).optional(),
-  instructions: z.string().optional(),
-  maxTurns: z.coerce.number().int().positive().optional(),
-  cwd: z.string().optional(),
-  workspaceRef: z.string().optional(),
-  executionId: z.string().optional(),
-  dbExecutionId: z.string().optional(),
-  parentExecutionId: z.string().optional(),
-  workflowId: z.string().optional(),
-  nodeId: z.string().optional(),
-  nodeName: z.string().optional(),
-  agentConfig: AgentConfig.optional(),
+  prompt: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  tools: z.union([z.array(z.string()), z.record(z.string(), z.boolean()), z.string()]).nullable().optional(),
+  instructions: z.string().nullable().optional(),
+  maxTurns: z.coerce.number().int().positive().nullable().optional(),
+  cwd: z.string().nullable().optional(),
+  workspaceRef: z.string().nullable().optional(),
+  executionId: z.string().nullable().optional(),
+  dbExecutionId: z.string().nullable().optional(),
+  parentExecutionId: z.string().nullable().optional(),
+  workflowId: z.string().nullable().optional(),
+  nodeId: z.string().nullable().optional(),
+  nodeName: z.string().nullable().optional(),
+  agentConfig: AgentConfig.nullable().optional(),
   plan: z.any().optional(),
   planJson: z.any().optional(),
-  artifactRef: z.string().optional(),
+  artifactRef: z.string().nullable().optional(),
 })
 
 const RunStarted = z.object({
@@ -1410,7 +1410,7 @@ export const DurableRoutes = lazy(() =>
             agent: body.agentConfig?.name?.trim() || "build",
             model: parseModel(body),
             tools: parseTools(body),
-            instructions: body.agentConfig?.instructions ?? body.instructions,
+            instructions: body.agentConfig?.instructions ?? body.instructions ?? undefined,
           }
           const instanceID = await withWorkflowClient((client) =>
             client.scheduleNewWorkflow(durableRunWorkflow, workflowInput, id),
@@ -1479,7 +1479,7 @@ export const DurableRoutes = lazy(() =>
             agent: body.agentConfig?.name?.trim() || "build",
             model: parseModel(body),
             tools: parseTools(body),
-            instructions: body.agentConfig?.instructions ?? body.instructions,
+            instructions: body.agentConfig?.instructions ?? body.instructions ?? undefined,
           }
           const instanceID = await withWorkflowClient((client) =>
             client.scheduleNewWorkflow(durableRunWorkflow, workflowInput, id),
@@ -1537,7 +1537,7 @@ export const DurableRoutes = lazy(() =>
             agent: body.agentConfig?.name?.trim() || "plan",
             model: parseModel(body),
             tools: parseTools(body),
-            instructions: body.agentConfig?.instructions ?? body.instructions,
+            instructions: body.agentConfig?.instructions ?? body.instructions ?? undefined,
           }
           const state = await withWorkflowClient(async (client) => {
             const instanceID = await client.scheduleNewWorkflow(durablePlanWorkflow, workflowInput, id)
