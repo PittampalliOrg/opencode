@@ -10,13 +10,13 @@ import { Provider } from "@/provider/provider"
 import { SessionPrompt } from "@/session/prompt"
 import { Session } from "@/session"
 import { MessageV2 } from "@/session/message-v2"
-import { ToolRegistry } from "@/tool/registry"
 import { Filesystem } from "@/util/filesystem"
 import { lazy } from "@/util/lazy"
 import { Log } from "@/util/log"
 import path from "path"
 import { request as httpsRequest } from "node:https"
 import { existsSync, readFileSync } from "node:fs"
+import { createHash } from "node:crypto"
 
 const log = Log.create({ service: "server.durable" })
 const PLAN_OPEN = "<proposed_plan>"
@@ -37,6 +37,7 @@ const WORKSPACE_COMMAND_TIMEOUT_MS = Number.parseInt(process.env.WORKSPACE_COMMA
 const WORKSPACE_CLONE_TIMEOUT_MS = Number.parseInt(process.env.WORKSPACE_CLONE_TIMEOUT_MS ?? "120000", 10)
 const WORKSPACE_STRIP_CLONE_GIT_DIR = String(process.env.WORKSPACE_CLONE_STRIP_GIT_DIR ?? "true").toLowerCase() !== "false"
 const WORKSPACE_STORE_PATH = path.join(Global.Path.state, "durable-workspaces", "sessions.json")
+const WORKSPACE_CHANGE_STORE_PATH = path.join(Global.Path.state, "durable-workspaces", "changes.json")
 const WORKSPACE_SANDBOX_NAMESPACE = process.env.WORKSPACE_SANDBOX_NAMESPACE?.trim() || process.env.SANDBOX_NAMESPACE?.trim() || "agent-sandbox"
 const WORKSPACE_SANDBOX_TEMPLATE = process.env.WORKSPACE_SANDBOX_TEMPLATE?.trim() || process.env.SANDBOX_TEMPLATE?.trim() || "dapr-agent"
 const WORKSPACE_SANDBOX_PORT = Number.parseInt(process.env.WORKSPACE_SANDBOX_PORT ?? "8888", 10)
@@ -69,6 +70,8 @@ const RunInput = z.object({
   tools: z.union([z.array(z.string()), z.record(z.string(), z.boolean()), z.string()]).nullable().optional(),
   instructions: z.string().nullable().optional(),
   maxTurns: z.coerce.number().int().positive().nullable().optional(),
+  requireFileChanges: z.union([z.boolean(), z.string()]).nullable().optional(),
+  waitForCompletion: z.union([z.boolean(), z.string()]).nullable().optional(),
   cwd: z.string().nullable().optional(),
   workspaceRef: z.string().nullable().optional(),
   executionId: z.string().nullable().optional(),
@@ -204,6 +207,126 @@ const WorkspaceActionResponse = z.object({
   error: z.string().optional(),
 })
 
+const WorkspaceChangeFileStatus = z.enum(["A", "M", "D", "R"])
+
+const WorkspaceChangeFileEntry = z.object({
+  path: z.string(),
+  status: WorkspaceChangeFileStatus,
+  oldPath: z.string().optional(),
+})
+
+const WorkspaceChangeMetadata = z.object({
+  changeSetId: z.string(),
+  executionId: z.string(),
+  workspaceRef: z.string(),
+  durableInstanceId: z.string().optional(),
+  operation: z.string(),
+  sequence: z.number().int().positive(),
+  format: z.literal("git-unified-v1"),
+  sha256: z.string(),
+  filesChanged: z.number().int().nonnegative(),
+  additions: z.number().int().nonnegative(),
+  deletions: z.number().int().nonnegative(),
+  bytes: z.number().int().nonnegative(),
+  compressed: z.boolean(),
+  storageRef: z.string(),
+  createdAt: z.string(),
+  includeInExecutionPatch: z.boolean(),
+  truncated: z.boolean(),
+  originalBytes: z.number().int().nonnegative(),
+  files: z.array(WorkspaceChangeFileEntry),
+  baseRevision: z.string().optional(),
+  headRevision: z.string().optional(),
+})
+
+const WorkspaceChangesResponse = z.object({
+  success: z.boolean(),
+  executionId: z.string(),
+  count: z.number().int().nonnegative(),
+  changes: z.array(WorkspaceChangeMetadata),
+  pending: z.boolean().optional(),
+})
+
+const WorkspaceChangeArtifactResponse = z.object({
+  success: z.boolean(),
+  executionId: z.string(),
+  metadata: WorkspaceChangeMetadata,
+  patch: z.string(),
+})
+
+const WorkspaceExecutionPatchResponse = z.object({
+  success: z.boolean(),
+  executionId: z.string(),
+  durableInstanceId: z.string().optional(),
+  patch: z.string(),
+  changeSets: z.array(WorkspaceChangeMetadata),
+})
+
+const WorkspaceFileSnapshotHistoryEntry = z.object({
+  id: z.string(),
+  changeSetId: z.string(),
+  sequence: z.number().int().positive(),
+  path: z.string(),
+  oldPath: z.string().optional(),
+  status: WorkspaceChangeFileStatus,
+  isBinary: z.boolean(),
+  language: z.string().optional(),
+  oldBytes: z.number().int().nonnegative(),
+  newBytes: z.number().int().nonnegative(),
+  oldStorageRef: z.string().optional(),
+  newStorageRef: z.string().optional(),
+  oldCompressed: z.boolean(),
+  newCompressed: z.boolean(),
+  createdAt: z.string(),
+})
+
+const WorkspaceFileSnapshot = z.object({
+  executionId: z.string(),
+  path: z.string(),
+  oldPath: z.string().optional(),
+  status: WorkspaceChangeFileStatus,
+  isBinary: z.boolean(),
+  language: z.string().optional(),
+  oldContent: z.string().nullable(),
+  newContent: z.string().nullable(),
+  oldBytes: z.number().int().nonnegative(),
+  newBytes: z.number().int().nonnegative(),
+  baseRevision: z.string().optional(),
+  headRevision: z.string().optional(),
+  history: z.array(WorkspaceFileSnapshotHistoryEntry),
+})
+
+const WorkspaceFileSnapshotResponse = z.object({
+  success: z.boolean(),
+  executionId: z.string(),
+  path: z.string(),
+  durableInstanceId: z.string().optional(),
+  snapshot: WorkspaceFileSnapshot,
+})
+
+const WorkspaceStoredSnapshot = z.object({
+  path: z.string(),
+  oldPath: z.string().optional(),
+  status: WorkspaceChangeFileStatus,
+  isBinary: z.boolean(),
+  language: z.string().optional(),
+  oldContent: z.string().nullable(),
+  newContent: z.string().nullable(),
+  oldBytes: z.number().int().nonnegative(),
+  newBytes: z.number().int().nonnegative(),
+})
+
+const WorkspaceStoredChangeArtifact = z.object({
+  metadata: WorkspaceChangeMetadata,
+  patch: z.string(),
+  snapshots: z.array(WorkspaceStoredSnapshot),
+})
+
+const WorkspaceStoredChangeRecord = z.object({
+  version: z.number().int().positive().optional(),
+  artifacts: z.array(WorkspaceStoredChangeArtifact).default([]),
+})
+
 const ToolsResponse = z.object({
   success: z.literal(true),
   tools: z.array(
@@ -310,6 +433,37 @@ type WorkspaceActionInput = {
   durableInstanceId?: string
 }
 
+type ChangeFileStatus = z.infer<typeof WorkspaceChangeFileStatus>
+
+type ChangeFileEntry = z.infer<typeof WorkspaceChangeFileEntry>
+
+type ChangeMetadata = z.infer<typeof WorkspaceChangeMetadata>
+
+type ChangeSnapshotHistoryEntry = z.infer<typeof WorkspaceFileSnapshotHistoryEntry>
+
+type ChangeSnapshot = {
+  path: string
+  oldPath?: string
+  status: ChangeFileStatus
+  isBinary: boolean
+  language?: string
+  oldContent: string | null
+  newContent: string | null
+  oldBytes: number
+  newBytes: number
+}
+
+type ChangeArtifact = {
+  metadata: ChangeMetadata
+  patch: string
+  snapshots: ChangeSnapshot[]
+}
+
+type ChangeStoreRecord = {
+  version: number
+  artifacts: ChangeArtifact[]
+}
+
 let durableRuntime: WorkflowRuntime | undefined
 let durableClient: DaprWorkflowClient | undefined
 let durableStarting: Promise<void> | undefined
@@ -319,6 +473,38 @@ const durableToWorkspace = new Map<string, string>()
 let workspaceStoreReady = false
 let workspaceStoreLoading: Promise<void> | undefined
 let workspaceStorePersisting = Promise.resolve()
+const changeArtifacts = new Map<string, ChangeArtifact>()
+const executionToChangeSets = new Map<string, string[]>()
+let changeStoreReady = false
+let changeStoreLoading: Promise<void> | undefined
+let changeStorePersisting = Promise.resolve()
+
+const languageByExtension: Record<string, string> = {
+  ts: "typescript",
+  tsx: "tsx",
+  js: "javascript",
+  jsx: "jsx",
+  py: "python",
+  json: "json",
+  md: "markdown",
+  css: "css",
+  scss: "scss",
+  html: "html",
+  yaml: "yaml",
+  yml: "yaml",
+  sh: "bash",
+  bash: "bash",
+  go: "go",
+  rs: "rust",
+  sql: "sql",
+  java: "java",
+  rb: "ruby",
+  php: "php",
+  c: "c",
+  h: "c",
+  cpp: "cpp",
+  hpp: "cpp",
+}
 
 function rid(prefix: string) {
   return `${prefix}-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`
@@ -638,6 +824,352 @@ async function persistWorkspaceStore() {
       })
     })
   return workspaceStorePersisting
+}
+
+function normalizeChangePathKey(input: string) {
+  return input.trim().replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/^\/+/, "").replace(/\/+/g, "/")
+}
+
+function changePathForFile(session: WorkspaceSession, fullPath: string) {
+  const base = session.clonePath && containsPosixPath(session.clonePath, fullPath) ? session.clonePath : session.rootPath
+  const relative = normalizeChangePathKey(path.posix.relative(base, fullPath))
+  return relative || path.posix.basename(fullPath)
+}
+
+function changeLanguage(input: string) {
+  const normalized = normalizeChangePathKey(input)
+  const extension = normalized.includes(".") ? normalized.split(".").pop()?.toLowerCase() : undefined
+  if (!extension) return
+  return languageByExtension[extension]
+}
+
+function isBinaryContent(content: string) {
+  if (!content) return false
+  if (content.includes("\u0000")) return true
+  const sample = Buffer.from(content, "utf-8").subarray(0, 1024)
+  if (!sample.length) return false
+  const controls = [...sample].filter((byte) => (byte < 9 || (byte > 13 && byte < 32)) && byte !== 27).length
+  return controls / sample.length > 0.3
+}
+
+function textLineCount(content: string | null) {
+  if (content === null || content.length === 0) return 0
+  return content.split("\n").length
+}
+
+function diffLines(content: string | null, prefix: "-" | "+") {
+  if (content === null || content.length === 0) return [] as string[]
+  return content.split("\n").map((line) => `${prefix}${line}`)
+}
+
+function buildUnifiedPatch(input: {
+  path: string
+  status: ChangeFileStatus
+  oldContent: string | null
+  newContent: string | null
+  isBinary: boolean
+}) {
+  const filePath = normalizeChangePathKey(input.path)
+  const oldLabel = input.status === "A" ? "/dev/null" : `a/${filePath}`
+  const newLabel = input.status === "D" ? "/dev/null" : `b/${filePath}`
+  if (input.isBinary) {
+    return [
+      `diff --git a/${filePath} b/${filePath}`,
+      `--- ${oldLabel}`,
+      `+++ ${newLabel}`,
+      "Binary files differ",
+      "",
+    ].join("\n")
+  }
+  const oldLines = textLineCount(input.oldContent)
+  const newLines = textLineCount(input.newContent)
+  const oldStart = input.status === "A" ? 0 : 1
+  const newStart = input.status === "D" ? 0 : 1
+  return [
+    `diff --git a/${filePath} b/${filePath}`,
+    `--- ${oldLabel}`,
+    `+++ ${newLabel}`,
+    `@@ -${oldStart},${oldLines} +${newStart},${newLines} @@`,
+    ...diffLines(input.oldContent, "-"),
+    ...diffLines(input.newContent, "+"),
+    "",
+  ].join("\n")
+}
+
+function compareChangeArtifacts(left: ChangeArtifact, right: ChangeArtifact) {
+  if (left.metadata.sequence !== right.metadata.sequence) return left.metadata.sequence - right.metadata.sequence
+  return Date.parse(left.metadata.createdAt) - Date.parse(right.metadata.createdAt)
+}
+
+function changeArtifactsForExecution(executionId: string) {
+  const ids = executionToChangeSets.get(executionId) ?? []
+  return [...new Set(ids)]
+    .flatMap((changeSetId) => {
+      const artifact = changeArtifacts.get(changeSetId)
+      if (!artifact) return []
+      return [artifact]
+    })
+    .sort(compareChangeArtifacts)
+}
+
+function nextChangeSequence(executionId: string) {
+  const max = changeArtifactsForExecution(executionId).reduce((value, artifact) => Math.max(value, artifact.metadata.sequence), 0)
+  return max + 1
+}
+
+function nextChangeSetID() {
+  return `chg_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`
+}
+
+async function ensureChangeStore() {
+  if (changeStoreReady) return
+  if (!changeStoreLoading) {
+    changeStoreLoading = (async () => {
+      const file = await Filesystem.readJson<unknown>(WORKSPACE_CHANGE_STORE_PATH).catch(() => undefined)
+      const parsed = WorkspaceStoredChangeRecord.safeParse(file ?? {})
+      if (!parsed.success) {
+        changeStoreReady = true
+        return
+      }
+      changeArtifacts.clear()
+      executionToChangeSets.clear()
+      for (const artifact of parsed.data.artifacts) {
+        const normalized: ChangeArtifact = {
+          metadata: artifact.metadata,
+          patch: artifact.patch,
+          snapshots: artifact.snapshots,
+        }
+        changeArtifacts.set(normalized.metadata.changeSetId, normalized)
+      }
+      for (const artifact of [...changeArtifacts.values()].sort(compareChangeArtifacts)) {
+        const executionId = artifact.metadata.executionId
+        const ids = executionToChangeSets.get(executionId) ?? []
+        ids.push(artifact.metadata.changeSetId)
+        executionToChangeSets.set(executionId, ids)
+      }
+      changeStoreReady = true
+    })().catch((error: unknown) => {
+      log.warn("failed loading workspace change store", {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      changeStoreReady = true
+    })
+  }
+  await changeStoreLoading
+}
+
+async function persistChangeStore() {
+  await ensureChangeStore()
+  changeStorePersisting = changeStorePersisting
+    .catch(() => undefined)
+    .then(async () => {
+      await Filesystem.writeJson(WORKSPACE_CHANGE_STORE_PATH, {
+        version: 1,
+        artifacts: [...changeArtifacts.values()].sort(compareChangeArtifacts),
+      } satisfies ChangeStoreRecord)
+    })
+  return changeStorePersisting
+}
+
+async function recordWorkspaceChange(input: {
+  session: WorkspaceSession
+  operation: string
+  durableInstanceId?: string
+  includeInExecutionPatch?: boolean
+  patch: string
+  files: ChangeFileEntry[]
+  additions: number
+  deletions: number
+  snapshots: ChangeSnapshot[]
+  baseRevision?: string
+  headRevision?: string
+}) {
+  await ensureChangeStore()
+  const changeSetId = nextChangeSetID()
+  const patchBytes = Buffer.byteLength(input.patch, "utf-8")
+  const metadata: ChangeMetadata = {
+    changeSetId,
+    executionId: input.session.executionId,
+    workspaceRef: input.session.workspaceRef,
+    durableInstanceId: input.durableInstanceId?.trim() || input.session.durableInstanceId,
+    operation: input.operation,
+    sequence: nextChangeSequence(input.session.executionId),
+    format: "git-unified-v1",
+    sha256: createHash("sha256").update(input.patch).digest("hex"),
+    filesChanged: input.files.length,
+    additions: Math.max(0, Math.floor(input.additions)),
+    deletions: Math.max(0, Math.floor(input.deletions)),
+    bytes: patchBytes,
+    compressed: false,
+    storageRef: `inline:${changeSetId}`,
+    createdAt: new Date().toISOString(),
+    includeInExecutionPatch: input.includeInExecutionPatch !== false,
+    truncated: false,
+    originalBytes: patchBytes,
+    files: input.files,
+    baseRevision: input.baseRevision,
+    headRevision: input.headRevision,
+  }
+  const artifact: ChangeArtifact = {
+    metadata,
+    patch: input.patch,
+    snapshots: input.snapshots,
+  }
+  changeArtifacts.set(changeSetId, artifact)
+  const ids = executionToChangeSets.get(metadata.executionId) ?? []
+  ids.push(changeSetId)
+  executionToChangeSets.set(metadata.executionId, ids)
+  await persistChangeStore()
+  return artifact
+}
+
+async function readWorkspaceChangeArtifact(changeSetId: string) {
+  await ensureChangeStore()
+  const id = changeSetId.trim()
+  if (!id) return
+  return changeArtifacts.get(id)
+}
+
+async function listWorkspaceExecutionChanges(input: {
+  executionId: string
+  durableInstanceId?: string
+  includeExcluded?: boolean
+}) {
+  await ensureChangeStore()
+  const executionId = input.executionId.trim()
+  if (!executionId) return [] as ChangeArtifact[]
+  return changeArtifactsForExecution(executionId).filter((artifact) => {
+    if (input.includeExcluded !== true && !artifact.metadata.includeInExecutionPatch) return false
+    if (input.durableInstanceId && artifact.metadata.durableInstanceId !== input.durableInstanceId) return false
+    return true
+  })
+}
+
+async function executionPatch(input: {
+  executionId: string
+  durableInstanceId?: string
+  includeExcluded?: boolean
+}) {
+  const artifacts = await listWorkspaceExecutionChanges(input)
+  return {
+    patch: artifacts.map((artifact) => artifact.patch).filter(Boolean).join("\n"),
+    changeSets: artifacts.map((artifact) => artifact.metadata),
+  }
+}
+
+async function executionFileSnapshot(input: {
+  executionId: string
+  path: string
+  durableInstanceId?: string
+}) {
+  const requestedPath = normalizeChangePathKey(input.path)
+  if (!requestedPath) return
+  const artifacts = await listWorkspaceExecutionChanges({
+    executionId: input.executionId,
+    durableInstanceId: input.durableInstanceId,
+    includeExcluded: true,
+  })
+  if (!artifacts.length) return
+  const lineagePaths = new Set<string>([requestedPath])
+  const lineage = [] as Array<{
+    artifact: ChangeArtifact
+    snapshot: ChangeSnapshot
+  }>
+  for (const artifact of artifacts) {
+    for (const snapshot of artifact.snapshots) {
+      const currentPath = normalizeChangePathKey(snapshot.path)
+      const oldPath = snapshot.oldPath ? normalizeChangePathKey(snapshot.oldPath) : undefined
+      if (!lineagePaths.has(currentPath) && (!oldPath || !lineagePaths.has(oldPath))) continue
+      lineage.push({ artifact, snapshot })
+      lineagePaths.add(currentPath)
+      if (oldPath) lineagePaths.add(oldPath)
+    }
+  }
+  if (!lineage.length) return
+  const firstWithOld = lineage.find((entry) => entry.snapshot.oldContent !== null || entry.snapshot.oldBytes > 0)
+  const lastWithNew = [...lineage].reverse().find((entry) => entry.snapshot.newContent !== null || entry.snapshot.newBytes > 0)
+  const last = lineage[lineage.length - 1]
+  const isBinary = lineage.some((entry) => entry.snapshot.isBinary)
+  const history = lineage.map((entry, index): ChangeSnapshotHistoryEntry => {
+    const digest = createHash("sha256")
+      .update(`${entry.artifact.metadata.changeSetId}:${index}:${entry.snapshot.path}:${entry.snapshot.oldPath ?? ""}`)
+      .digest("hex")
+      .slice(0, 18)
+    return {
+      id: `chgfil_${digest}`,
+      changeSetId: entry.artifact.metadata.changeSetId,
+      sequence: entry.artifact.metadata.sequence,
+      path: entry.snapshot.path,
+      oldPath: entry.snapshot.oldPath,
+      status: entry.snapshot.status,
+      isBinary: entry.snapshot.isBinary,
+      language: entry.snapshot.language,
+      oldBytes: entry.snapshot.oldBytes,
+      newBytes: entry.snapshot.newBytes,
+      oldStorageRef: undefined,
+      newStorageRef: undefined,
+      oldCompressed: false,
+      newCompressed: false,
+      createdAt: entry.artifact.metadata.createdAt,
+    }
+  })
+  return {
+    executionId: input.executionId.trim(),
+    path: last.snapshot.path,
+    oldPath: last.snapshot.oldPath,
+    status: last.snapshot.status,
+    isBinary,
+    language: last.snapshot.language,
+    oldContent: isBinary ? null : firstWithOld?.snapshot.oldContent ?? null,
+    newContent: isBinary ? null : lastWithNew?.snapshot.newContent ?? null,
+    oldBytes: firstWithOld?.snapshot.oldBytes ?? 0,
+    newBytes: lastWithNew?.snapshot.newBytes ?? 0,
+    baseRevision: lineage.find((entry) => entry.artifact.metadata.baseRevision)?.artifact.metadata.baseRevision,
+    headRevision: [...lineage].reverse().find((entry) => entry.artifact.metadata.headRevision)?.artifact.metadata.headRevision,
+    history,
+  }
+}
+
+async function captureWorkspaceFileChange(input: {
+  session: WorkspaceSession
+  operation: "write" | "edit"
+  fullPath: string
+  oldContent: string | null
+  newContent: string
+  durableInstanceId?: string
+}) {
+  if (input.oldContent === input.newContent) return
+  const pathKey = changePathForFile(input.session, input.fullPath)
+  const status: ChangeFileStatus = input.oldContent === null ? "A" : "M"
+  const binary = isBinaryContent(input.oldContent ?? "") || isBinaryContent(input.newContent)
+  const snapshot: ChangeSnapshot = {
+    path: pathKey,
+    oldPath: undefined,
+    status,
+    isBinary: binary,
+    language: changeLanguage(pathKey),
+    oldContent: binary ? null : input.oldContent,
+    newContent: binary ? null : input.newContent,
+    oldBytes: input.oldContent === null ? 0 : Buffer.byteLength(input.oldContent, "utf-8"),
+    newBytes: Buffer.byteLength(input.newContent, "utf-8"),
+  }
+  const patch = buildUnifiedPatch({
+    path: pathKey,
+    status,
+    oldContent: snapshot.oldContent,
+    newContent: snapshot.newContent,
+    isBinary: snapshot.isBinary,
+  })
+  return await recordWorkspaceChange({
+    session: input.session,
+    operation: input.operation,
+    durableInstanceId: input.durableInstanceId,
+    patch,
+    files: [{ path: pathKey, status }],
+    additions: snapshot.isBinary ? 0 : textLineCount(snapshot.newContent),
+    deletions: snapshot.isBinary ? 0 : status === "A" ? 0 : textLineCount(snapshot.oldContent),
+    snapshots: [snapshot],
+  })
 }
 
 function touchWorkspace(session: WorkspaceSession) {
@@ -1277,10 +1809,24 @@ async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInpu
     const fullPath = resolveWorkspacePath(session, input.path, operation)
     assertCloneScope(session, fullPath, operation)
     await enforceReadBeforeWrite(session, fullPath)
-    await writeWorkspaceFile(session, fullPath, input.content ?? "")
+    const existed = await sandboxPathExists(session, fullPath)
+    const oldContent = existed ? await readWorkspaceFile(session, fullPath) : null
+    const newContent = input.content ?? ""
+    await writeWorkspaceFile(session, fullPath, newContent)
+    const artifact = await captureWorkspaceFileChange({
+      session,
+      operation: "write",
+      fullPath,
+      oldContent,
+      newContent,
+      durableInstanceId: parseDurableInstanceID(input),
+    })
     touchWorkspace(session)
     await persistWorkspaceStore()
-    return { path: input.path ?? "" }
+    return {
+      path: input.path ?? "",
+      changeSetId: artifact?.metadata.changeSetId,
+    }
   }
 
   if (operation === "edit") {
@@ -1291,10 +1837,22 @@ async function runWorkspaceFileOperation(input: z.infer<typeof WorkspaceFileInpu
     if (!oldString) throw new Error("old_string is required for edit")
     const current = await readWorkspaceFile(session, fullPath)
     if (!current.includes(oldString)) throw new Error(`old_string not found in ${input.path}`)
-    await writeWorkspaceFile(session, fullPath, current.replace(oldString, input.new_string ?? ""))
+    const updated = current.replace(oldString, input.new_string ?? "")
+    await writeWorkspaceFile(session, fullPath, updated)
+    const artifact = await captureWorkspaceFileChange({
+      session,
+      operation: "edit",
+      fullPath,
+      oldContent: current,
+      newContent: updated,
+      durableInstanceId: parseDurableInstanceID(input),
+    })
     touchWorkspace(session)
     await persistWorkspaceStore()
-    return { path: input.path ?? "" }
+    return {
+      path: input.path ?? "",
+      changeSetId: artifact?.metadata.changeSetId,
+    }
   }
 
   if (operation === "list") {
@@ -1402,15 +1960,44 @@ function parseTools(input: z.infer<typeof RunInput>): Record<string, boolean> | 
   return input.tools
 }
 
+function parseOptionalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value
+  if (typeof value !== "string") return undefined
+  const normalized = value.trim().toLowerCase()
+  if (normalized === "true") return true
+  if (normalized === "false") return false
+  return undefined
+}
+
 async function resolveTools(input: z.infer<typeof RunInput>) {
   const parsed = parseTools(input)
   if (!parsed) return undefined
-  const available = new Set(await ToolRegistry.ids())
-  const unknown = Object.keys(parsed).filter((tool) => !available.has(tool))
-  if (unknown.length > 0) {
-    throw new Error(`invalid tools: ${unknown.join(", ")}`)
+  return Object.fromEntries(
+    Object.entries(parsed).flatMap(([tool, enabled]) => (enabled ? [[tool, true] as const] : [])),
+  )
+}
+
+async function workspaceHasGitMutations(input: { workspaceRef?: string; executionId?: string }) {
+  const workspaceRef = input.workspaceRef?.trim() || ""
+  const executionId = input.executionId?.trim() || ""
+  if (!workspaceRef && !executionId) return false
+  let session: WorkspaceSession
+  try {
+    session = await resolveWorkspaceFromInput({
+      workspaceRef: workspaceRef || undefined,
+      executionId: executionId || undefined,
+    })
+  } catch {
+    return false
   }
-  return parsed
+  const result = await executeSandboxCommand({
+    session,
+    command: "if [ -d .git ]; then git status --porcelain; else true; fi",
+    cwd: session.clonePath ?? session.rootPath,
+    timeoutMs: Math.min(session.commandTimeoutMs, 15000),
+  })
+  if (!result.success) return false
+  return Boolean(result.stdout.trim())
 }
 
 const opus46Aliases = new Set([
@@ -1555,8 +2142,23 @@ async function runPrompt(input: {
   instructions?: string
 }) {
   return await withDir(input.cwd, async () => {
-    const agentName = input.agent ?? (await Agent.defaultAgent())
-    const agent = await Agent.get(agentName)
+    // Durable runs must not load workspace plugin dependencies from .opencode.
+    process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS = "true"
+    process.env.OPENCODE_DISABLE_PROJECT_CONFIG = "true"
+    const requested = input.agent?.trim()
+    let agentName = requested || (await Agent.defaultAgent())
+    let agent = await Agent.get(agentName)
+    if (!agent && requested) {
+      const fallback = await Agent.defaultAgent()
+      if (fallback !== agentName) {
+        agentName = fallback
+        agent = await Agent.get(agentName)
+      }
+    }
+    if (!agent && agentName !== "build") {
+      agentName = "build"
+      agent = await Agent.get(agentName)
+    }
     if (!agent) {
       throw new Error(`Agent "${agentName}" not found`)
     }
@@ -1771,15 +2373,27 @@ function executePrompt(input: z.infer<typeof RunInput>) {
 }
 
 async function durableRunActivity(_ctx: WorkflowActivityContext, input: DurableRunPayload) {
-  const msg = await runPrompt({
-    prompt: input.prompt,
-    cwd: input.cwd,
-    model: input.model,
-    tools: input.tools,
-    instructions: input.instructions,
-    agent: input.agent,
-  })
-  return toResult(msg)
+  try {
+    const msg = await runPrompt({
+      prompt: input.prompt,
+      cwd: input.cwd,
+      model: input.model,
+      tools: input.tools,
+      instructions: input.instructions,
+      agent: input.agent,
+    })
+    return {
+      success: true,
+      workflow_id: input.workflowID,
+      result: toResult(msg),
+    } satisfies DurableRunResult
+  } catch (error: unknown) {
+    return {
+      success: false,
+      workflow_id: input.workflowID,
+      error: error instanceof Error ? error.message : String(error),
+    } satisfies DurableRunResult
+  }
 }
 
 async function durablePublishCompletionActivity(
@@ -1843,7 +2457,28 @@ async function* durableRunWorkflow(
   input: DurableRunPayload,
 ): AsyncGenerator<unknown, DurableRunResult, unknown> {
   try {
-    const result = (yield ctx.callActivity(durableRunActivity, input)) as Record<string, unknown>
+    const outcome = (yield ctx.callActivity(durableRunActivity, input)) as DurableRunResult
+    if (!outcome.success) {
+      const error = outcome.error || "durable run activity failed"
+      yield ctx.callActivity(durablePublishCompletionActivity, {
+        workflowID: input.workflowID,
+        parentExecutionID: input.parentExecutionID,
+        executionID: input.executionID,
+        dbExecutionID: input.dbExecutionID,
+        workflowDefinitionID: input.workflowDefinitionID,
+        nodeID: input.nodeID,
+        nodeName: input.nodeName,
+        workspaceRef: input.workspaceRef,
+        success: false,
+        error,
+      })
+      return {
+        success: false,
+        workflow_id: input.workflowID,
+        error,
+      }
+    }
+    const result = outcome.result ?? {}
     yield ctx.callActivity(durablePublishCompletionActivity, {
       workflowID: input.workflowID,
       parentExecutionID: input.parentExecutionID,
@@ -2056,6 +2691,8 @@ export const DurableRoutes = lazy(() =>
         }
         try {
           const id = rid("durable-run")
+          const waitForCompletion = parseOptionalBoolean(body.waitForCompletion) ?? false
+          const requireFileChanges = parseOptionalBoolean(body.requireFileChanges) ?? false
           const workflowInput: DurableRunPayload = {
             workflowID: id,
             parentExecutionID: body.parentExecutionId?.trim() || "",
@@ -2075,10 +2712,67 @@ export const DurableRoutes = lazy(() =>
           const instanceID = await withWorkflowClient((client) =>
             client.scheduleNewWorkflow(durableRunWorkflow, workflowInput, id),
           )
+          if (!waitForCompletion) {
+            return c.json({
+              success: true,
+              workflow_id: id,
+              dapr_instance_id: instanceID,
+            })
+          }
+          const timeoutMinutes = body.agentConfig?.timeoutMinutes ?? 15
+          const timeoutSeconds = Math.min(Math.max(timeoutMinutes * 60 + 30, 90), 3600)
+          const state = await withWorkflowClient((client) =>
+            client.waitForWorkflowCompletion(instanceID, true, timeoutSeconds),
+          )
+          if (!state) {
+            c.status(504)
+            return c.json({
+              success: false,
+              workflow_id: id,
+              dapr_instance_id: instanceID,
+              error: "execution timed out before workflow state was available",
+            })
+          }
+          const typed = state as unknown as WorkflowStateLike
+          const output = parseWorkflowOutput(typed.serializedOutput)
+          if (typed.runtimeStatus !== WORKFLOW_COMPLETED) {
+            c.status(500)
+            return c.json({
+              success: false,
+              workflow_id: id,
+              dapr_instance_id: instanceID,
+              error: workflowFailure(typed, output),
+            })
+          }
+          if (output?.success === false) {
+            c.status(500)
+            return c.json({
+              success: false,
+              workflow_id: id,
+              dapr_instance_id: instanceID,
+              error: workflowFailure(typed, output),
+            })
+          }
+          if (requireFileChanges) {
+            const changed = await workspaceHasGitMutations({
+              workspaceRef: workflowInput.workspaceRef,
+              executionId: workflowInput.executionID || workflowInput.dbExecutionID,
+            })
+            if (!changed) {
+              c.status(422)
+              return c.json({
+                success: false,
+                workflow_id: id,
+                dapr_instance_id: instanceID,
+                error: "Execution required file changes but repository is unchanged.",
+              })
+            }
+          }
           return c.json({
             success: true,
             workflow_id: id,
             dapr_instance_id: instanceID,
+            result: output?.result ?? output,
           })
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error)
@@ -2387,7 +3081,7 @@ export const DurableRoutes = lazy(() =>
         try {
           const result = await runWorkspaceClone(body)
           return c.json({
-            success: true,
+            success: result.success,
             result,
           })
         } catch (error: unknown) {
@@ -2421,7 +3115,7 @@ export const DurableRoutes = lazy(() =>
         try {
           const result = await runWorkspaceCommand(body)
           return c.json({
-            success: true,
+            success: result.success,
             result,
           })
         } catch (error: unknown) {
@@ -2465,6 +3159,212 @@ export const DurableRoutes = lazy(() =>
             error: error instanceof Error ? error.message : String(error),
           })
         }
+      },
+    )
+    .get(
+      "/workspaces/changes/:changeSetId",
+      describeRoute({
+        summary: "Get workspace change artifact",
+        operationId: "durable.workspaceChangeArtifact",
+        responses: {
+          200: {
+            description: "change artifact",
+            content: {
+              "application/json": {
+                schema: resolver(WorkspaceChangeArtifactResponse),
+              },
+            },
+          },
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          changeSetId: z.string(),
+        }),
+      ),
+      async (c) => {
+        const changeSetId = c.req.valid("param").changeSetId.trim()
+        if (!changeSetId) {
+          c.status(400)
+          return c.json({
+            success: false,
+            error: "changeSetId is required",
+          })
+        }
+        const artifact = await readWorkspaceChangeArtifact(changeSetId)
+        if (!artifact) {
+          c.status(404)
+          return c.json({
+            success: false,
+            error: "Change artifact not found",
+          })
+        }
+        return c.json({
+          success: true,
+          executionId: artifact.metadata.executionId,
+          metadata: artifact.metadata,
+          patch: artifact.patch,
+        })
+      },
+    )
+    .get(
+      "/workspaces/executions/:executionId/changes",
+      describeRoute({
+        summary: "List change artifacts for execution",
+        operationId: "durable.executionChanges",
+        responses: {
+          200: {
+            description: "execution changes",
+            content: {
+              "application/json": {
+                schema: resolver(WorkspaceChangesResponse),
+              },
+            },
+          },
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          executionId: z.string(),
+        }),
+      ),
+      async (c) => {
+        const executionId = c.req.valid("param").executionId.trim()
+        if (!executionId) {
+          c.status(400)
+          return c.json({
+            success: false,
+            error: "executionId is required",
+          })
+        }
+        const changes = await listWorkspaceExecutionChanges({
+          executionId,
+          includeExcluded: true,
+        })
+        return c.json({
+          success: true,
+          executionId,
+          count: changes.length,
+          changes: changes.map((artifact) => artifact.metadata),
+        })
+      },
+    )
+    .get(
+      "/workspaces/executions/:executionId/patch",
+      describeRoute({
+        summary: "Get combined execution patch",
+        operationId: "durable.executionPatch",
+        responses: {
+          200: {
+            description: "execution patch",
+            content: {
+              "application/json": {
+                schema: resolver(WorkspaceExecutionPatchResponse),
+              },
+            },
+          },
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          executionId: z.string(),
+        }),
+      ),
+      async (c) => {
+        const executionId = c.req.valid("param").executionId.trim()
+        if (!executionId) {
+          c.status(400)
+          return c.json({
+            success: false,
+            error: "executionId is required",
+          })
+        }
+        const durableInstanceId = c.req.query("durableInstanceId")?.trim()
+        const includeExcluded = parseWorkspaceBoolean(c.req.query("includeExcluded"))
+        const combined = await executionPatch({
+          executionId,
+          durableInstanceId: durableInstanceId || undefined,
+          includeExcluded,
+        })
+        if (c.req.query("format") === "raw") {
+          return new Response(combined.patch, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/plain; charset=utf-8",
+            },
+          })
+        }
+        return c.json({
+          success: true,
+          executionId,
+          durableInstanceId: durableInstanceId || undefined,
+          patch: combined.patch,
+          changeSets: combined.changeSets,
+        })
+      },
+    )
+    .get(
+      "/workspaces/executions/:executionId/files/snapshot",
+      describeRoute({
+        summary: "Get file snapshot for execution",
+        operationId: "durable.executionFileSnapshot",
+        responses: {
+          200: {
+            description: "file snapshot",
+            content: {
+              "application/json": {
+                schema: resolver(WorkspaceFileSnapshotResponse),
+              },
+            },
+          },
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          executionId: z.string(),
+        }),
+      ),
+      async (c) => {
+        const executionId = c.req.valid("param").executionId.trim()
+        if (!executionId) {
+          c.status(400)
+          return c.json({
+            success: false,
+            error: "executionId is required",
+          })
+        }
+        const filePath = c.req.query("path")?.trim() || ""
+        if (!filePath) {
+          c.status(400)
+          return c.json({
+            success: false,
+            error: "path is required",
+          })
+        }
+        const durableInstanceId = c.req.query("durableInstanceId")?.trim()
+        const snapshot = await executionFileSnapshot({
+          executionId,
+          path: filePath,
+          durableInstanceId: durableInstanceId || undefined,
+        })
+        if (!snapshot) {
+          c.status(404)
+          return c.json({
+            success: false,
+            error: "File snapshot not found for execution",
+          })
+        }
+        return c.json({
+          success: true,
+          executionId,
+          path: filePath,
+          durableInstanceId: durableInstanceId || undefined,
+          snapshot,
+        })
       },
     )
     .post(
