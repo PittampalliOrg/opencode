@@ -1,4 +1,9 @@
-import { DaprWorkflowClient, WorkflowRuntime, type WorkflowActivityContext, type WorkflowContext } from "@dapr/dapr"
+import {
+  DaprWorkflowClient,
+  WorkflowRuntime,
+  type WorkflowActivityContext,
+  type WorkflowContext,
+} from "@dapr/dapr"
 import { Hono } from "hono"
 import { describeRoute, resolver, validator } from "hono-openapi"
 import z from "zod"
@@ -13,9 +18,12 @@ import { MessageV2 } from "@/session/message-v2"
 import { Filesystem } from "@/util/filesystem"
 import { lazy } from "@/util/lazy"
 import { Log } from "@/util/log"
+import { Tool } from "@/tool/tool"
+import { ToolRegistry } from "@/tool/registry"
 import path from "path"
 import { request as httpsRequest } from "node:https"
 import { existsSync, readFileSync } from "node:fs"
+import { stat as fsStat } from "node:fs/promises"
 import { createHash } from "node:crypto"
 
 const log = Log.create({ service: "server.durable" })
@@ -61,8 +69,18 @@ const AgentConfig = z
     tools: z.array(z.string()).optional(),
     maxTurns: z.number().int().positive().optional(),
     timeoutMinutes: z.number().int().positive().optional(),
+    configuration: z
+      .object({
+        storeName: z.string().min(1),
+        configName: z.string().optional(),
+        keys: z.array(z.string()).optional(),
+        metadata: z.record(z.string(), z.string()).optional(),
+      })
+      .optional(),
   })
   .partial()
+
+const RunExecutionMode = z.enum(["legacy", "sandboxed"])
 
 const RunInput = z.object({
   prompt: z.string().nullable().optional(),
@@ -70,6 +88,9 @@ const RunInput = z.object({
   tools: z.union([z.array(z.string()), z.record(z.string(), z.boolean()), z.string()]).nullable().optional(),
   instructions: z.string().nullable().optional(),
   maxTurns: z.coerce.number().int().positive().nullable().optional(),
+  timeoutMinutes: z.coerce.number().int().positive().nullable().optional(),
+  hardTimeoutMinutes: z.coerce.number().int().positive().nullable().optional(),
+  executionMode: RunExecutionMode.nullable().optional(),
   requireFileChanges: z.union([z.boolean(), z.string()]).nullable().optional(),
   waitForCompletion: z.union([z.boolean(), z.string()]).nullable().optional(),
   cwd: z.string().nullable().optional(),
@@ -131,9 +152,11 @@ const WorkspaceCloneInput = z.object({
   workspaceRef: z.string().optional(),
   executionId: z.string().optional(),
   durableInstanceId: z.string().optional(),
+  repositoryUrl: z.string().optional(),
   repositoryOwner: z.string().optional(),
   repositoryRepo: z.string().optional(),
-  repositoryBranch: z.string().optional(),
+  repositoryBranch: z.string().min(1),
+  repositoryUsername: z.string().optional(),
   targetDir: z.string().optional(),
   repositoryToken: z.string().optional(),
   githubToken: z.string().optional(),
@@ -354,6 +377,8 @@ type DurableRunPayload = {
   model?: ModelRef
   tools?: Record<string, boolean>
   instructions?: string
+  executionMode?: z.infer<typeof RunExecutionMode>
+  hardTimeoutMinutes?: number
 }
 
 type DurableRunResult = {
@@ -1660,26 +1685,90 @@ function assertWorkspaceTool(session: WorkspaceSession, tool: WorkspaceTool) {
   throw new Error(`Tool "${tool}" is disabled for workspace ${session.workspaceRef}`)
 }
 
+function attachRepositoryCredentials(input: { repositoryUrl: string; repositoryToken?: string; repositoryUsername?: string }) {
+  const token = input.repositoryToken?.trim() || ""
+  if (!token) return input.repositoryUrl
+  const username = input.repositoryUsername?.trim() || ""
+  let parsed: URL
+  try {
+    parsed = new URL(input.repositoryUrl)
+  } catch {
+    return input.repositoryUrl
+  }
+  if (parsed.username || parsed.password) return input.repositoryUrl
+  if (username) {
+    parsed.username = username
+    parsed.password = token
+    return parsed.toString()
+  }
+  parsed.username = token
+  return parsed.toString()
+}
+
+function sanitizeCloneError(input: { error: string; repositoryToken?: string; repositoryUsername?: string }) {
+  const token = input.repositoryToken?.trim() || ""
+  if (!token) return input.error
+  const username = input.repositoryUsername?.trim() || ""
+  const encodedToken = encodeURIComponent(token)
+  const encodedPair = username ? `${encodeURIComponent(username)}:${encodedToken}` : ""
+  const plainPair = username ? `${username}:${token}` : ""
+  let sanitized = input.error.replaceAll(token, "***")
+  sanitized = sanitized.replaceAll(encodedToken, "***")
+  if (plainPair) sanitized = sanitized.replaceAll(plainPair, "***:***")
+  if (encodedPair) sanitized = sanitized.replaceAll(encodedPair, "***:***")
+  return sanitized
+}
+
+function repositoryLabel(input: { repositoryUrl: string; repositoryOwner?: string; repositoryRepo?: string }) {
+  const owner = input.repositoryOwner?.trim() || ""
+  const repo = input.repositoryRepo?.trim() || ""
+  if (owner && repo) return `${owner}/${repo}`
+  try {
+    const parsed = new URL(input.repositoryUrl)
+    const pathname = parsed.pathname.replace(/^\/+/, "").replace(/\.git$/i, "")
+    if (!pathname) return parsed.host
+    return `${parsed.host}/${pathname}`
+  } catch {
+    return input.repositoryUrl
+  }
+}
+
 async function runWorkspaceClone(input: z.infer<typeof WorkspaceCloneInput>) {
   const session = await resolveWorkspaceFromInput(input)
   assertWorkspaceTool(session, "bash")
   await bindWorkspaceDurableInstance(session, parseDurableInstanceID(input))
+  const repositoryUrl = input.repositoryUrl?.trim() || ""
   const repositoryOwner = input.repositoryOwner?.trim() || ""
   const repositoryRepo = input.repositoryRepo?.trim() || ""
-  if (!repositoryOwner || !repositoryRepo) {
-    throw new Error("repositoryOwner and repositoryRepo are required")
+  if (!repositoryUrl && (!repositoryOwner || !repositoryRepo)) {
+    throw new Error("repositoryUrl or repositoryOwner/repositoryRepo are required")
   }
-  const branch = input.repositoryBranch?.trim() || "main"
+  const branch = input.repositoryBranch.trim()
+  const baseRepositoryURL = repositoryUrl || `https://github.com/${repositoryOwner}/${repositoryRepo}.git`
+  let parsedRepositoryURL: URL
+  try {
+    parsedRepositoryURL = new URL(baseRepositoryURL)
+  } catch {
+    throw new Error("repositoryUrl must be a valid absolute URL")
+  }
+  if (parsedRepositoryURL.protocol !== "http:" && parsedRepositoryURL.protocol !== "https:") {
+    throw new Error("repositoryUrl must use http or https")
+  }
+  const repoFromUrl = path.posix.basename(parsedRepositoryURL.pathname).replace(/\.git$/i, "")
+  const repositoryName = repositoryRepo || repoFromUrl
   const timeoutMs = parseWorkspaceTimeout(input.timeoutMs) ?? Math.max(session.commandTimeoutMs, WORKSPACE_CLONE_TIMEOUT_MS)
-  const cloneDir = resolveCloneTargetDir(repositoryRepo, input.targetDir)
+  const cloneDir = resolveCloneTargetDir(repositoryName, input.targetDir)
   const clonePath = normalizePosixPath(path.posix.resolve(session.rootPath, cloneDir))
   if (!containsPosixPath(session.rootPath, clonePath)) {
     throw new Error("targetDir must stay inside workspace root")
   }
   const token = input.repositoryToken?.trim() || input.githubToken?.trim() || ""
-  const repositoryURL = token
-    ? `https://${token}@github.com/${repositoryOwner}/${repositoryRepo}.git`
-    : `https://github.com/${repositoryOwner}/${repositoryRepo}.git`
+  const repositoryUsername = input.repositoryUsername?.trim() || ""
+  const repositoryURL = attachRepositoryCredentials({
+    repositoryUrl: baseRepositoryURL,
+    repositoryToken: token,
+    repositoryUsername,
+  })
 
   const gitCheck = await executeSandboxCommand({
     session,
@@ -1703,7 +1792,11 @@ async function runWorkspaceClone(input: z.infer<typeof WorkspaceCloneInput>) {
     timeoutMs,
   })
   if (!clone.success) {
-    const sanitized = token ? clone.stderr.replaceAll(token, "***") : clone.stderr
+    const sanitized = sanitizeCloneError({
+      error: clone.stderr,
+      repositoryToken: token,
+      repositoryUsername,
+    })
     throw new Error(`git clone failed: ${sanitized || "unknown clone error"}`)
   }
 
@@ -1714,7 +1807,6 @@ async function runWorkspaceClone(input: z.infer<typeof WorkspaceCloneInput>) {
     timeoutMs: Math.min(timeoutMs, 30000),
   })
   const commitHash = rev.success ? rev.stdout.trim() || "unknown" : "unknown"
-
   const files = await executeSandboxCommand({
     session,
     command: "git ls-files --cached",
@@ -1745,7 +1837,11 @@ async function runWorkspaceClone(input: z.infer<typeof WorkspaceCloneInput>) {
   return {
     success: true,
     clonePath,
-    repository: `${repositoryOwner}/${repositoryRepo}`,
+    repository: repositoryLabel({
+      repositoryUrl: baseRepositoryURL,
+      repositoryOwner,
+      repositoryRepo,
+    }),
     branch,
     commitHash,
     fileCount,
@@ -1768,10 +1864,20 @@ async function runWorkspaceCommand(input: z.infer<typeof WorkspaceCommandInput>)
     cwd,
     timeoutMs,
   })
+  const normalized = !result.success && result.exitCode === 2 && `${result.stdout}\n${result.stderr}`
+    .toLowerCase()
+    .includes("no file changes detected after durable run")
+    ? {
+        ...result,
+        success: true,
+        exitCode: 0,
+        stderr: "",
+      }
+    : result
   touchWorkspace(session)
   await persistWorkspaceStore()
   return {
-    ...result,
+    ...normalized,
     sandbox: workspaceSandbox(session),
   }
 }
@@ -1933,6 +2039,463 @@ const workspaceSweepTimer = setInterval(() => {
 }, WORKSPACE_SWEEP_MS)
 workspaceSweepTimer.unref()
 
+type AgentConfigStoreOverrides = {
+  name?: string
+  modelSpec?: string
+  instructions?: string
+  tools?: string[]
+  maxTurns?: number
+  timeoutMinutes?: number
+  role?: string
+  goal?: string
+  systemPrompt?: string
+}
+
+type AgentConfigStoreTarget = {
+  storeName: string
+  keys: string[]
+  metadata: Record<string, string>
+  cacheKey: string
+}
+
+type AgentConfigStoreSubscription = {
+  target: AgentConfigStoreTarget
+  overrides?: AgentConfigStoreOverrides
+  subscriptionID?: string
+  starting?: Promise<void>
+}
+
+const DAPR_HTTP_HOST = process.env.DAPR_HOST?.trim() || "127.0.0.1"
+const DAPR_HTTP_PORT = process.env.DAPR_HTTP_PORT?.trim() || "3500"
+const configStoreSubscriptions = new Map<string, AgentConfigStoreSubscription>()
+let configStoreShutdownRegistered = false
+
+type ResolvedAgentConfig = {
+  name?: string
+  modelSpec?: string
+  instructions?: string
+  tools?: string[]
+  maxTurns?: number
+  timeoutMinutes?: number
+}
+
+function configString(value: unknown) {
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+    return trimmed || undefined
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value)
+  }
+  return
+}
+
+function configNumber(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.floor(value)
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value.trim(), 10)
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+  }
+  return
+}
+
+function configTools(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const parsed = value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean)
+    if (!parsed.length) return
+    return [...new Set(parsed)]
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+    if (!trimmed) return
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      try {
+        return configTools(JSON.parse(trimmed))
+      } catch {
+        return
+      }
+    }
+    const parsed = trimmed.split(",").map((item) => item.trim()).filter(Boolean)
+    if (!parsed.length) return
+    return [...new Set(parsed)]
+  }
+  if (value && typeof value === "object") {
+    const parsed = Object.entries(value as Record<string, unknown>)
+      .filter(([, enabled]) => enabled === true || enabled === "true")
+      .map(([tool]) => tool.trim())
+      .filter(Boolean)
+    if (!parsed.length) return
+    return [...new Set(parsed)]
+  }
+  return
+}
+
+function normalizeConfigKey(key: string) {
+  return key.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_")
+}
+
+function applyConfigOverride(overrides: AgentConfigStoreOverrides, key: string, value: unknown) {
+  const normalized = normalizeConfigKey(key)
+  if (normalized === "name" || normalized === "agent_name") {
+    const parsed = configString(value)
+    if (parsed) overrides.name = parsed
+    return
+  }
+  if (normalized === "model" || normalized === "model_spec" || normalized === "modelspec" || normalized === "llm_model") {
+    const parsed = configString(value)
+    if (parsed) overrides.modelSpec = parsed
+    return
+  }
+  if (normalized === "instructions" || normalized === "agent_instructions") {
+    const parsed = Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean).join("\n")
+      : configString(value)
+    if (parsed) overrides.instructions = parsed
+    return
+  }
+  if (normalized === "system_prompt" || normalized === "agent_system_prompt") {
+    const parsed = configString(value)
+    if (parsed) overrides.systemPrompt = parsed
+    return
+  }
+  if (normalized === "role" || normalized === "agent_role") {
+    const parsed = configString(value)
+    if (parsed) overrides.role = parsed
+    return
+  }
+  if (normalized === "goal" || normalized === "agent_goal") {
+    const parsed = configString(value)
+    if (parsed) overrides.goal = parsed
+    return
+  }
+  if (normalized === "tools" || normalized === "agent_tools") {
+    const parsed = configTools(value)
+    if (parsed) overrides.tools = parsed
+    return
+  }
+  if (normalized === "max_turns" || normalized === "max_turn" || normalized === "max_iterations" || normalized === "maxturns") {
+    const parsed = configNumber(value)
+    if (parsed) overrides.maxTurns = parsed
+    return
+  }
+  if (normalized === "timeout_minutes" || normalized === "timeoutminutes") {
+    const parsed = configNumber(value)
+    if (parsed) overrides.timeoutMinutes = parsed
+  }
+}
+
+function configStoreInstructions(overrides: AgentConfigStoreOverrides | undefined) {
+  if (!overrides) return
+  if (overrides.instructions) return overrides.instructions
+  const parts = [
+    overrides.systemPrompt,
+    overrides.role ? `Role: ${overrides.role}` : undefined,
+    overrides.goal ? `Goal: ${overrides.goal}` : undefined,
+  ].filter((value): value is string => Boolean(value && value.trim()))
+  if (!parts.length) return
+  return parts.join("\n\n")
+}
+
+function createConfigStoreTarget(input: z.infer<typeof RunInput>) {
+  const config = input.agentConfig?.configuration
+  if (!config?.storeName?.trim()) return
+  const storeName = config.storeName.trim()
+  const configName = config.configName?.trim()
+  const keys = (config.keys ?? []).map((key) => key.trim()).filter(Boolean)
+  const metadata = Object.fromEntries(
+    Object.entries(config.metadata ?? {})
+      .map(([key, value]) => [key.trim(), value.trim()] as const)
+      .filter(([key, value]) => Boolean(key) && Boolean(value)),
+  )
+  const effectiveKeys = keys.length > 0 ? [...new Set(keys)] : configName ? [configName] : []
+  return {
+    storeName,
+    keys: effectiveKeys,
+    metadata,
+    cacheKey: JSON.stringify({
+      storeName,
+      keys: [...effectiveKeys].sort(),
+      metadata: Object.entries(metadata).sort(([a], [b]) => a.localeCompare(b)),
+    }),
+  } satisfies AgentConfigStoreTarget
+}
+
+function parseConfigStoreOverrides(items: Record<string, { value?: unknown }>) {
+  const overrides: AgentConfigStoreOverrides = {}
+  for (const [key, item] of Object.entries(items)) {
+    const rawValue = item?.value
+    if (typeof rawValue !== "string") {
+      applyConfigOverride(overrides, key, rawValue)
+      continue
+    }
+    try {
+      const parsed = JSON.parse(rawValue)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [nestedKey, nestedValue] of Object.entries(parsed)) {
+          applyConfigOverride(overrides, nestedKey, nestedValue)
+        }
+        continue
+      }
+      applyConfigOverride(overrides, key, parsed)
+    } catch {
+      applyConfigOverride(overrides, key, rawValue)
+    }
+  }
+  if (!Object.keys(overrides).length) return
+  return overrides
+}
+
+function normalizeConfigStoreItems(items: unknown) {
+  if (Array.isArray(items)) {
+    return Object.fromEntries(
+      items.flatMap((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return []
+        const value = item as Record<string, unknown>
+        const key = typeof value.key === "string" ? value.key.trim() : ""
+        if (!key) return []
+        return [[key, { value: value.value }] as const]
+      }),
+    )
+  }
+  if (items && typeof items === "object" && !Array.isArray(items)) {
+    const value = items as Record<string, unknown>
+    if (typeof value.key === "string") {
+      const key = value.key.trim()
+      if (!key) return {}
+      return { [key]: { value: value.value } }
+    }
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          return [key, { value: entry }] as const
+        }
+        const item = entry as Record<string, unknown>
+        if (!("value" in item)) return [key, { value: entry }] as const
+        return [key, { value: item.value }] as const
+      }),
+    )
+  }
+  return {}
+}
+
+type ConfigStorePushResult = {
+  matched: number
+  updated: number
+}
+
+export function applyConfigStorePush(input: {
+  storeName?: string
+  key?: string
+  payload: unknown
+}): ConfigStorePushResult {
+  const storeName = input.storeName?.trim()
+  const key = input.key?.trim()
+  const payload = input.payload && typeof input.payload === "object" && !Array.isArray(input.payload)
+    ? input.payload as Record<string, unknown>
+    : undefined
+  const subscriptionID = typeof payload?.id === "string" ? payload.id.trim() : ""
+  const items = normalizeConfigStoreItems(payload?.items ?? payload)
+  const overrides = parseConfigStoreOverrides(items)
+  if (!overrides) return { matched: 0, updated: 0 }
+  let matched = 0
+  for (const subscription of configStoreSubscriptions.values()) {
+    if (subscriptionID && subscription.subscriptionID && subscription.subscriptionID !== subscriptionID) continue
+    if (storeName && subscription.target.storeName !== storeName) continue
+    if (key && subscription.target.keys.length > 0 && !subscription.target.keys.includes(key)) continue
+    matched += 1
+    subscription.overrides = {
+      ...(subscription.overrides ?? {}),
+      ...overrides,
+    }
+  }
+  if (matched > 0) {
+    log.info("received dynamic config update", {
+      storeName: storeName || "<unknown>",
+      key: key || "<batch>",
+      subscriptionID: subscriptionID || "<none>",
+      matched,
+    })
+  }
+  return { matched, updated: matched }
+}
+
+async function fetchConfigStoreOverrides(target: AgentConfigStoreTarget) {
+  const url = new URL(
+    `http://${DAPR_HTTP_HOST}:${DAPR_HTTP_PORT}/v1.0/configuration/${encodeURIComponent(target.storeName)}`,
+  )
+  for (const key of target.keys) {
+    url.searchParams.append("key", key)
+  }
+  for (const [key, value] of Object.entries(target.metadata)) {
+    url.searchParams.set(`metadata.${key}`, value)
+  }
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    signal: AbortSignal.timeout(5000),
+  })
+  if (!response.ok) {
+    throw new Error(`configuration get failed (${response.status})`)
+  }
+  const payload = (await response.json()) as
+    | { items?: Record<string, { value?: unknown }> }
+    | Record<string, { value?: unknown }>
+  const items = payload && typeof payload === "object" && "items" in payload && payload.items && typeof payload.items === "object" && !Array.isArray(payload.items)
+    ? payload.items as Record<string, { value?: unknown }>
+    : (payload as Record<string, { value?: unknown }>)
+  return parseConfigStoreOverrides(items)
+}
+
+async function subscribeConfigStoreTarget(subscription: AgentConfigStoreSubscription) {
+  try {
+    subscription.overrides = await fetchConfigStoreOverrides(subscription.target)
+  } catch (error: unknown) {
+    log.warn("failed initial config load for dapr config subscription", {
+      storeName: subscription.target.storeName,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+  try {
+    const url = new URL(
+      `http://${DAPR_HTTP_HOST}:${DAPR_HTTP_PORT}/v1.0/configuration/${encodeURIComponent(subscription.target.storeName)}/subscribe`,
+    )
+    for (const key of subscription.target.keys) {
+      url.searchParams.append("key", key)
+    }
+    for (const [key, value] of Object.entries(subscription.target.metadata)) {
+      url.searchParams.set(`metadata.${key}`, value)
+    }
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!response.ok) {
+      throw new Error(`configuration subscribe failed (${response.status})`)
+    }
+    const payload = (await response.json()) as { id?: unknown }
+    const subscriptionID = typeof payload.id === "string" ? payload.id.trim() : ""
+    if (!subscriptionID) {
+      throw new Error("configuration subscribe returned empty id")
+    }
+    subscription.subscriptionID = subscriptionID
+    log.info("subscribed to dapr config store", {
+      storeName: subscription.target.storeName,
+      keyCount: subscription.target.keys.length,
+      subscriptionID,
+    })
+  } catch (error: unknown) {
+    log.warn("failed subscribing to dapr config store", {
+      storeName: subscription.target.storeName,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+function ensureConfigStoreSubscription(target: AgentConfigStoreTarget) {
+  let subscription = configStoreSubscriptions.get(target.cacheKey)
+  if (!subscription) {
+    subscription = { target }
+    configStoreSubscriptions.set(target.cacheKey, subscription)
+  }
+  if (!subscription.subscriptionID && !subscription.starting) {
+    subscription.starting = subscribeConfigStoreTarget(subscription).finally(() => {
+      if (subscription) subscription.starting = undefined
+    })
+  }
+  return subscription
+}
+
+async function unsubscribeConfigStoreTarget(subscription: AgentConfigStoreSubscription) {
+  if (!subscription.subscriptionID) return
+  const encodedStore = encodeURIComponent(subscription.target.storeName)
+  const encodedID = encodeURIComponent(subscription.subscriptionID)
+  const urls = [
+    `http://${DAPR_HTTP_HOST}:${DAPR_HTTP_PORT}/v1.0/configuration/${encodedStore}/${encodedID}/unsubscribe`,
+    `http://${DAPR_HTTP_HOST}:${DAPR_HTTP_PORT}/v1.0-alpha1/configuration/${encodedStore}/${encodedID}/unsubscribe`,
+  ]
+  let lastError = "unknown error"
+  for (const url of urls) {
+    const response = await fetch(url, {
+      method: "GET",
+      signal: AbortSignal.timeout(5000),
+    })
+    if (response.ok) return
+    lastError = `${response.status}`
+  }
+  throw new Error(`configuration unsubscribe failed (${lastError})`)
+}
+
+async function stopConfigStoreSubscriptions() {
+  const stops = [...configStoreSubscriptions.values()].flatMap((subscription) => {
+    if (!subscription.subscriptionID) return []
+    return [
+      Promise.resolve(unsubscribeConfigStoreTarget(subscription)).catch((error: unknown) => {
+        log.warn("failed stopping config subscription", {
+          storeName: subscription.target.storeName,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }),
+    ]
+  })
+  configStoreSubscriptions.clear()
+  await Promise.all(stops)
+}
+
+function registerConfigStoreShutdown() {
+  if (configStoreShutdownRegistered) return
+  configStoreShutdownRegistered = true
+  const close = () => {
+    void stopConfigStoreSubscriptions()
+  }
+  process.once("SIGINT", close)
+  process.once("SIGTERM", close)
+  process.once("beforeExit", close)
+}
+
+async function loadConfigStoreAgentOverrides(input: z.infer<typeof RunInput>) {
+  const target = createConfigStoreTarget(input)
+  if (!target) return
+  try {
+    const subscription = ensureConfigStoreSubscription(target)
+    if (subscription.overrides !== undefined) {
+      return subscription.overrides
+    }
+    const overrides = await fetchConfigStoreOverrides(target)
+    subscription.overrides = overrides
+    return overrides
+  } catch (error: unknown) {
+    log.warn("failed loading agent config from dapr config store", {
+      storeName: target.storeName,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return
+  }
+}
+
+async function resolveAgentConfig(input: z.infer<typeof RunInput>, inlineName: string): Promise<ResolvedAgentConfig> {
+  const requestConfig = input.agentConfig
+  const configStore = await loadConfigStoreAgentOverrides(input)
+  const inlineModel = typeof input.model === "string" ? input.model.trim() : ""
+  const inlineInstructions = typeof input.instructions === "string" ? input.instructions : undefined
+  const inlineTools = configTools(input.tools)
+  const modelSpec = requestConfig?.modelSpec?.trim() || configStore?.modelSpec?.trim() || inlineModel || undefined
+  const name = requestConfig?.name?.trim() || configStore?.name?.trim() || (modelSpec ? inlineName : undefined)
+  const tools = requestConfig?.tools?.length
+    ? [...new Set(requestConfig.tools.map((tool) => tool.trim()).filter(Boolean))]
+    : configStore?.tools ?? inlineTools
+  const instructions = requestConfig?.instructions ?? configStoreInstructions(configStore) ?? inlineInstructions
+  return {
+    name,
+    modelSpec,
+    instructions,
+    maxTurns: requestConfig?.maxTurns ?? configStore?.maxTurns,
+    timeoutMinutes: requestConfig?.timeoutMinutes ?? configStore?.timeoutMinutes,
+    tools,
+  }
+}
+
 function parseTools(input: z.infer<typeof RunInput>): Record<string, boolean> | undefined {
   if (!input.tools) return input.agentConfig?.tools ? Object.fromEntries(input.agentConfig.tools.map((x) => [x, true])) : undefined
   if (Array.isArray(input.tools)) {
@@ -1969,8 +2532,77 @@ function parseOptionalBoolean(value: unknown): boolean | undefined {
   return undefined
 }
 
-async function resolveTools(input: z.infer<typeof RunInput>) {
-  const parsed = parseTools(input)
+function parseRunExecutionMode(input: z.infer<typeof RunInput>, forced?: z.infer<typeof RunExecutionMode>) {
+  if (forced) return forced
+  return input.executionMode === "sandboxed" ? "sandboxed" : "legacy"
+}
+
+function parseRunHardTimeoutMinutes(input: z.infer<typeof RunInput>, config?: ResolvedAgentConfig) {
+  const candidate = input.hardTimeoutMinutes ?? input.timeoutMinutes ?? config?.timeoutMinutes ?? input.agentConfig?.timeoutMinutes ?? 20
+  const parsed = Number.parseInt(`${candidate}`, 10)
+  if (!Number.isFinite(parsed)) return 20
+  return Math.min(Math.max(parsed, 1), 20)
+}
+
+async function localDirectoryExists(value: string) {
+  const stat = await fsStat(value).catch(() => undefined)
+  if (!stat) return false
+  return stat.isDirectory()
+}
+
+async function preflightSandboxedRun(input: DurableRunPayload) {
+  if (input.executionMode !== "sandboxed") return
+  const workspaceRef = input.workspaceRef?.trim() || ""
+  const executionId = input.executionID?.trim() || input.dbExecutionID?.trim() || ""
+  if (!workspaceRef && !executionId) {
+    throw new Error("sandboxed durable run requires workspaceRef or executionId")
+  }
+  const session = await resolveWorkspaceFromInput({
+    workspaceRef: workspaceRef || undefined,
+    executionId: executionId || undefined,
+    durableInstanceId: input.workflowID,
+  })
+  await bindWorkspaceDurableInstance(session, input.workflowID)
+  const clonePath = session.clonePath?.trim() || ""
+  if (!clonePath) {
+    throw new Error(`workspace ${session.workspaceRef} has no clone path. Run workspace/clone before durable/run.`)
+  }
+  const sandboxPath = await executeSandboxCommand({
+    session,
+    command: `test -d ${shellEscape(clonePath)}`,
+    cwd: session.rootPath,
+    timeoutMs: Math.min(session.commandTimeoutMs, 15000),
+  })
+  if (!sandboxPath.success) {
+    throw new Error(`workspace clone path is unavailable in sandbox: ${clonePath}`)
+  }
+  input.cwd = clonePath
+  if (input.tools) {
+    const allowed = new Set<WorkspaceTool>(workspaceTools)
+    input.tools = Object.fromEntries(
+      Object.entries(input.tools).flatMap(([tool, enabled]) =>
+        enabled && allowed.has(tool as WorkspaceTool) ? [[tool, true] as const] : [],
+      ),
+    )
+  }
+  return session
+}
+
+async function preflightRunCwd(input: DurableRunPayload) {
+  const cwd = input.cwd?.trim()
+  if (!cwd) throw new Error("durable run requires cwd")
+  if (`${input.executionMode ?? ""}` === "sandboxed") return
+  if (await localDirectoryExists(cwd)) return
+  const hint = input.executionMode === "sandboxed"
+    ? "The workspace is available in the Kubernetes sandbox but not mounted in durable-agent."
+    : "Ensure workspace/clone completed and cwd points to a local directory."
+  throw new Error(`durable run cwd is not accessible locally: ${cwd}. ${hint}`)
+}
+
+async function resolveTools(input: z.infer<typeof RunInput>, config?: ResolvedAgentConfig) {
+  const parsed = config?.tools?.length
+    ? Object.fromEntries(config.tools.map((tool) => [tool, true]))
+    : parseTools(input)
   if (!parsed) return undefined
   return Object.fromEntries(
     Object.entries(parsed).flatMap(([tool, enabled]) => (enabled ? [[tool, true] as const] : [])),
@@ -2081,8 +2713,8 @@ async function resolveOpusModel(): Promise<ModelRef> {
   )
 }
 
-async function resolveModel(input: z.infer<typeof RunInput>) {
-  const raw = (input.agentConfig?.modelSpec ?? input.model)?.trim()
+async function resolveModel(input: z.infer<typeof RunInput>, config?: ResolvedAgentConfig) {
+  const raw = (config?.modelSpec ?? input.agentConfig?.modelSpec ?? input.model)?.trim()
   if (!raw) return undefined
   const normalized = normalizeModelInput(raw)
   if (opus46Aliases.has(normalized)) {
@@ -2140,8 +2772,25 @@ async function runPrompt(input: {
   model?: ModelRef
   tools?: Record<string, boolean>
   instructions?: string
+  hardTimeoutMinutes?: number
+  workspaceSession?: WorkspaceSession
 }) {
   return await withDir(input.cwd, async () => {
+    const tools = input.workspaceSession
+      ? {
+          ...(input.tools ?? {}),
+          read: true,
+          list: true,
+          write: true,
+          edit: true,
+          bash: true,
+          apply_patch: false,
+          [SessionPrompt.SANDBOX_WORKSPACE_TOOL_MODE_KEY]: true,
+        }
+      : input.tools
+    if (input.workspaceSession) {
+      await registerSandboxWorkspaceTools(input.workspaceSession)
+    }
     // Durable runs must not load workspace plugin dependencies from .opencode.
     process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS = "true"
     process.env.OPENCODE_DISABLE_PROJECT_CONFIG = "true"
@@ -2163,11 +2812,12 @@ async function runPrompt(input: {
       throw new Error(`Agent "${agentName}" not found`)
     }
     const model = input.model ?? (await resolveAgentModel(agent))
-    return await SessionPrompt.prompt({
-      sessionID: (await Session.create({ title: `Durable ${agentName}` })).id,
+    const sessionID = (await Session.create({ title: `Durable ${agentName}` })).id
+    const prompt = SessionPrompt.prompt({
+      sessionID,
       agent: agentName,
       model,
-      tools: input.tools,
+      tools,
       system: input.instructions,
       parts: [
         {
@@ -2176,6 +2826,23 @@ async function runPrompt(input: {
         },
       ],
     })
+    const timeoutMinutes = Number.parseInt(`${input.hardTimeoutMinutes ?? 0}`, 10)
+    if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
+      return await prompt
+    }
+    const timeoutMs = timeoutMinutes * 60 * 1000
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<MessageV2.WithParts>((_, reject) => {
+      timer = setTimeout(() => {
+        SessionPrompt.cancel(sessionID)
+        reject(new Error(`durable run timed out after ${timeoutMinutes} minutes`))
+      }, timeoutMs)
+    })
+    try {
+      return await Promise.race([prompt, timeout])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   })
 }
 
@@ -2374,6 +3041,8 @@ function executePrompt(input: z.infer<typeof RunInput>) {
 
 async function durableRunActivity(_ctx: WorkflowActivityContext, input: DurableRunPayload) {
   try {
+    const sandboxSession = await preflightSandboxedRun(input)
+    await preflightRunCwd(input)
     const msg = await runPrompt({
       prompt: input.prompt,
       cwd: input.cwd,
@@ -2381,6 +3050,8 @@ async function durableRunActivity(_ctx: WorkflowActivityContext, input: DurableR
       tools: input.tools,
       instructions: input.instructions,
       agent: input.agent,
+      hardTimeoutMinutes: input.hardTimeoutMinutes,
+      workspaceSession: sandboxSession,
     })
     return {
       success: true,
@@ -2394,6 +3065,230 @@ async function durableRunActivity(_ctx: WorkflowActivityContext, input: DurableR
       error: error instanceof Error ? error.message : String(error),
     } satisfies DurableRunResult
   }
+}
+
+function sandboxRelativePath(session: WorkspaceSession, full: string) {
+  const base = session.clonePath ?? session.rootPath
+  const normalized = normalizePosixPath(full)
+  if (containsPosixPath(base, normalized)) {
+    const rel = path.posix.relative(base, normalized)
+    return rel || "."
+  }
+  return path.posix.basename(normalized) || normalized
+}
+
+async function registerSandboxWorkspaceTools(session: WorkspaceSession) {
+  const read = Tool.define("read", {
+    description: "Read files and directories from the active sandbox workspace.",
+    parameters: z.object({
+      filePath: z.string().describe("Absolute or workspace-relative path to file or directory"),
+      offset: z.coerce.number().int().positive().optional(),
+      limit: z.coerce.number().int().positive().optional(),
+    }),
+    async execute(params, ctx) {
+      const inputPath = params.filePath?.trim() || "."
+      const fullPath = normalizePosixPath(path.posix.resolve(session.rootPath, inputPath))
+      await ctx.ask({
+        permission: "read",
+        patterns: [fullPath],
+        always: ["*"],
+        metadata: {},
+      })
+      const checkDir = await executeSandboxCommand({
+        session,
+        command: `test -d ${shellEscape(fullPath)}`,
+        cwd: session.rootPath,
+        timeoutMs: Math.min(session.commandTimeoutMs, 15000),
+      })
+      if (checkDir.success) {
+        const listed = await runWorkspaceFileOperation({
+          workspaceRef: session.workspaceRef,
+          operation: "list",
+          path: fullPath,
+        })
+        const entries = (listed.files ?? []).map((entry) =>
+          entry.type === "directory" ? `${entry.name}/` : entry.name,
+        )
+        return {
+          title: sandboxRelativePath(session, fullPath),
+          metadata: { count: entries.length, truncated: false },
+          output: entries.length ? entries.join("\n") : "(empty directory)",
+        }
+      }
+      const readResult = await runWorkspaceFileOperation({
+        workspaceRef: session.workspaceRef,
+        operation: "read",
+        path: fullPath,
+      })
+      const lines = (readResult.content ?? "").split("\n")
+      const offset = params.offset ?? 1
+      const limit = params.limit ?? 2000
+      const start = Math.max(offset - 1, 0)
+      const sliced = lines.slice(start, start + limit)
+      const rendered = sliced.map((line, idx) => `${start + idx + 1}: ${line}`).join("\n")
+      return {
+        title: sandboxRelativePath(session, fullPath),
+        metadata: { count: sliced.length, truncated: start + sliced.length < lines.length },
+        output: rendered || "(empty file)",
+      }
+    },
+  })
+
+  const list = Tool.define("list", {
+    description: "List files and directories in the active sandbox workspace.",
+    parameters: z.object({
+      path: z.string().optional(),
+      ignore: z.array(z.string()).optional(),
+    }),
+    async execute(params, ctx) {
+      const inputPath = params.path?.trim() || "."
+      const fullPath = normalizePosixPath(path.posix.resolve(session.rootPath, inputPath))
+      await ctx.ask({
+        permission: "list",
+        patterns: [fullPath],
+        always: ["*"],
+        metadata: {},
+      })
+      const listed = await runWorkspaceFileOperation({
+        workspaceRef: session.workspaceRef,
+        operation: "list",
+        path: fullPath,
+      })
+      const entries = (listed.files ?? []).map((entry) =>
+        entry.type === "directory" ? `${entry.name}/` : entry.name,
+      )
+      return {
+        title: sandboxRelativePath(session, fullPath),
+        metadata: { count: entries.length, truncated: false },
+        output: entries.length ? entries.join("\n") : "(empty directory)",
+      }
+    },
+  })
+
+  const write = Tool.define("write", {
+    description: "Write file content into the active sandbox workspace.",
+    parameters: z.object({
+      content: z.string(),
+      filePath: z.string(),
+    }),
+    async execute(params, ctx) {
+      const fullPath = normalizePosixPath(path.posix.resolve(session.rootPath, params.filePath))
+      await ctx.ask({
+        permission: "edit",
+        patterns: [fullPath],
+        always: ["*"],
+        metadata: {},
+      })
+      const result = await runWorkspaceFileOperation({
+        workspaceRef: session.workspaceRef,
+        operation: "write",
+        path: fullPath,
+        content: params.content,
+      })
+      return {
+        title: sandboxRelativePath(session, fullPath),
+        metadata: { changeSetId: result.changeSetId },
+        output: "Wrote file successfully.",
+      }
+    },
+  })
+
+  const edit = Tool.define("edit", {
+    description: "Edit file content in the active sandbox workspace.",
+    parameters: z.object({
+      filePath: z.string(),
+      oldString: z.string(),
+      newString: z.string(),
+      replaceAll: z.boolean().optional(),
+    }),
+    async execute(params, ctx) {
+      const fullPath = normalizePosixPath(path.posix.resolve(session.rootPath, params.filePath))
+      await ctx.ask({
+        permission: "edit",
+        patterns: [fullPath],
+        always: ["*"],
+        metadata: {},
+      })
+      if (params.replaceAll) {
+        const read = await runWorkspaceFileOperation({
+          workspaceRef: session.workspaceRef,
+          operation: "read",
+          path: fullPath,
+        })
+        const current = read.content ?? ""
+        if (!current.includes(params.oldString)) {
+          throw new Error(`oldString not found in ${fullPath}`)
+        }
+        const updated = current.split(params.oldString).join(params.newString)
+        const writeResult = await runWorkspaceFileOperation({
+          workspaceRef: session.workspaceRef,
+          operation: "write",
+          path: fullPath,
+          content: updated,
+        })
+        return {
+          title: sandboxRelativePath(session, fullPath),
+          metadata: { changeSetId: writeResult.changeSetId },
+          output: "Edit applied successfully.",
+        }
+      }
+      const result = await runWorkspaceFileOperation({
+        workspaceRef: session.workspaceRef,
+        operation: "edit",
+        path: fullPath,
+        old_string: params.oldString,
+        new_string: params.newString,
+      })
+      return {
+        title: sandboxRelativePath(session, fullPath),
+        metadata: { changeSetId: result.changeSetId },
+        output: "Edit applied successfully.",
+      }
+    },
+  })
+
+  const bash = Tool.define("bash", {
+    description: "Run shell commands in the active sandbox workspace.",
+    parameters: z.object({
+      command: z.string(),
+      timeout: z.number().int().positive().optional(),
+      workdir: z.string().optional(),
+      description: z.string().optional(),
+    }),
+    async execute(params, ctx) {
+      await ctx.ask({
+        permission: "bash",
+        patterns: [params.command],
+        always: ["*"],
+        metadata: {},
+      })
+      const workdir = params.workdir?.trim()
+        ? normalizePosixPath(path.posix.resolve(session.rootPath, params.workdir.trim()))
+        : session.clonePath ?? session.rootPath
+      const wrapped = `cd ${shellEscape(workdir)} && ${params.command}`
+      const result = await runWorkspaceCommand({
+        workspaceRef: session.workspaceRef,
+        command: wrapped,
+        timeoutMs: params.timeout,
+      })
+      const output = [result.stdout, result.stderr].filter(Boolean).join(result.stdout && result.stderr ? "\n" : "")
+      return {
+        title: params.description?.trim() || "sandbox command",
+        metadata: {
+          exit: result.exitCode,
+          timedOut: result.timedOut,
+          executionTimeMs: result.executionTimeMs,
+        },
+        output: output || "(no output)",
+      }
+    },
+  })
+
+  await ToolRegistry.register(read)
+  await ToolRegistry.register(list)
+  await ToolRegistry.register(write)
+  await ToolRegistry.register(edit)
+  await ToolRegistry.register(bash)
 }
 
 async function durablePublishCompletionActivity(
@@ -2586,7 +3481,128 @@ async function withWorkflowClient<T>(fn: (client: DaprWorkflowClient) => Promise
   return await fn(durableClient)
 }
 
+async function executeDurableRunRequest(
+  body: z.infer<typeof RunInput>,
+  forcedMode?: z.infer<typeof RunExecutionMode>,
+): Promise<{
+  statusCode: 200 | 400 | 422 | 500 | 503 | 504
+  payload: Record<string, unknown>
+}> {
+  const prompt = body.prompt?.trim() ?? ""
+  if (!prompt) {
+    return {
+      statusCode: 400,
+      payload: {
+        success: false,
+        error: "prompt is required",
+      },
+    }
+  }
+  try {
+    const id = rid("durable-run")
+    const waitForCompletion = parseOptionalBoolean(body.waitForCompletion) ?? false
+    const requireFileChanges = parseOptionalBoolean(body.requireFileChanges) ?? false
+    const resolvedAgentConfig = await resolveAgentConfig(body, "inline-agent")
+    const hardTimeoutMinutes = parseRunHardTimeoutMinutes(body, resolvedAgentConfig)
+    const workflowInput: DurableRunPayload = {
+      workflowID: id,
+      parentExecutionID: body.parentExecutionId?.trim() || "",
+      executionID: body.executionId?.trim() || "",
+      dbExecutionID: body.dbExecutionId?.trim() || "",
+      workflowDefinitionID: body.workflowId?.trim() || "",
+      nodeID: body.nodeId?.trim() || "",
+      nodeName: body.nodeName?.trim() || "",
+      workspaceRef: body.workspaceRef?.trim() || "",
+      prompt,
+      cwd: body.cwd?.trim() || Instance.directory,
+      agent: resolvedAgentConfig.name || "build",
+      model: await resolveModel(body, resolvedAgentConfig),
+      tools: await resolveTools(body, resolvedAgentConfig),
+      instructions: resolvedAgentConfig.instructions ?? undefined,
+      executionMode: parseRunExecutionMode(body, forcedMode),
+      hardTimeoutMinutes,
+    }
+    const instanceID = await withWorkflowClient((client) =>
+      client.scheduleNewWorkflow(durableRunWorkflow, workflowInput, id),
+    )
+    if (!waitForCompletion) {
+      return {
+        statusCode: 200,
+        payload: {
+          success: true,
+          workflow_id: id,
+          dapr_instance_id: instanceID,
+        },
+      }
+    }
+    const timeoutSeconds = Math.min(Math.max(hardTimeoutMinutes * 60 + 30, 90), 3600)
+    const state = await withWorkflowClient((client) =>
+      client.waitForWorkflowCompletion(instanceID, true, timeoutSeconds),
+    )
+    if (!state) {
+      return {
+        statusCode: 504,
+        payload: {
+          success: false,
+          workflow_id: id,
+          dapr_instance_id: instanceID,
+          error: "execution timed out before workflow state was available",
+        },
+      }
+    }
+    const typed = state as unknown as WorkflowStateLike
+    const output = parseWorkflowOutput(typed.serializedOutput)
+    if (typed.runtimeStatus !== WORKFLOW_COMPLETED || output?.success === false) {
+      return {
+        statusCode: 500,
+        payload: {
+          success: false,
+          workflow_id: id,
+          dapr_instance_id: instanceID,
+          error: workflowFailure(typed, output),
+        },
+      }
+    }
+    if (requireFileChanges) {
+      const changed = await workspaceHasGitMutations({
+        workspaceRef: workflowInput.workspaceRef,
+        executionId: workflowInput.executionID || workflowInput.dbExecutionID,
+      })
+      if (!changed) {
+        return {
+          statusCode: 422,
+          payload: {
+            success: false,
+            workflow_id: id,
+            dapr_instance_id: instanceID,
+            error: "Execution required file changes but repository is unchanged.",
+          },
+        }
+      }
+    }
+    return {
+      statusCode: 200,
+      payload: {
+        success: true,
+        workflow_id: id,
+        dapr_instance_id: instanceID,
+        result: output?.result ?? output,
+      },
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    return {
+      statusCode: isInputValidationError(message) ? 400 : 503,
+      payload: {
+        success: false,
+        error: isInputValidationError(message) ? message : `durable runtime unavailable: ${message}`,
+      },
+    }
+  }
+}
+
 scheduleRuntimeBootstrap()
+registerConfigStoreShutdown()
 
 export const DurableRoutes = lazy(() =>
   new Hono()
@@ -2681,107 +3697,33 @@ export const DurableRoutes = lazy(() =>
       validator("json", RunInput),
       async (c) => {
         const body = c.req.valid("json")
-        const prompt = body.prompt?.trim() ?? ""
-        if (!prompt) {
-          c.status(400)
-          return c.json({
-            success: false,
-            error: "prompt is required",
-          })
-        }
-        try {
-          const id = rid("durable-run")
-          const waitForCompletion = parseOptionalBoolean(body.waitForCompletion) ?? false
-          const requireFileChanges = parseOptionalBoolean(body.requireFileChanges) ?? false
-          const workflowInput: DurableRunPayload = {
-            workflowID: id,
-            parentExecutionID: body.parentExecutionId?.trim() || "",
-            executionID: body.executionId?.trim() || "",
-            dbExecutionID: body.dbExecutionId?.trim() || "",
-            workflowDefinitionID: body.workflowId?.trim() || "",
-            nodeID: body.nodeId?.trim() || "",
-            nodeName: body.nodeName?.trim() || "",
-            workspaceRef: body.workspaceRef?.trim() || "",
-            prompt,
-            cwd: body.cwd?.trim() || Instance.directory,
-            agent: body.agentConfig?.name?.trim() || "build",
-            model: await resolveModel(body),
-            tools: await resolveTools(body),
-            instructions: body.agentConfig?.instructions ?? body.instructions ?? undefined,
-          }
-          const instanceID = await withWorkflowClient((client) =>
-            client.scheduleNewWorkflow(durableRunWorkflow, workflowInput, id),
-          )
-          if (!waitForCompletion) {
-            return c.json({
-              success: true,
-              workflow_id: id,
-              dapr_instance_id: instanceID,
-            })
-          }
-          const timeoutMinutes = body.agentConfig?.timeoutMinutes ?? 15
-          const timeoutSeconds = Math.min(Math.max(timeoutMinutes * 60 + 30, 90), 3600)
-          const state = await withWorkflowClient((client) =>
-            client.waitForWorkflowCompletion(instanceID, true, timeoutSeconds),
-          )
-          if (!state) {
-            c.status(504)
-            return c.json({
-              success: false,
-              workflow_id: id,
-              dapr_instance_id: instanceID,
-              error: "execution timed out before workflow state was available",
-            })
-          }
-          const typed = state as unknown as WorkflowStateLike
-          const output = parseWorkflowOutput(typed.serializedOutput)
-          if (typed.runtimeStatus !== WORKFLOW_COMPLETED) {
-            c.status(500)
-            return c.json({
-              success: false,
-              workflow_id: id,
-              dapr_instance_id: instanceID,
-              error: workflowFailure(typed, output),
-            })
-          }
-          if (output?.success === false) {
-            c.status(500)
-            return c.json({
-              success: false,
-              workflow_id: id,
-              dapr_instance_id: instanceID,
-              error: workflowFailure(typed, output),
-            })
-          }
-          if (requireFileChanges) {
-            const changed = await workspaceHasGitMutations({
-              workspaceRef: workflowInput.workspaceRef,
-              executionId: workflowInput.executionID || workflowInput.dbExecutionID,
-            })
-            if (!changed) {
-              c.status(422)
-              return c.json({
-                success: false,
-                workflow_id: id,
-                dapr_instance_id: instanceID,
-                error: "Execution required file changes but repository is unchanged.",
-              })
-            }
-          }
-          return c.json({
-            success: true,
-            workflow_id: id,
-            dapr_instance_id: instanceID,
-            result: output?.result ?? output,
-          })
-        } catch (error: unknown) {
-          const message = error instanceof Error ? error.message : String(error)
-          c.status(isInputValidationError(message) ? 400 : 503)
-          return c.json({
-            success: false,
-            error: isInputValidationError(message) ? message : `durable runtime unavailable: ${message}`,
-          })
-        }
+        const result = await executeDurableRunRequest(body)
+        c.status(result.statusCode)
+        return c.json(result.payload)
+      },
+    )
+    .post(
+      "/run-sandboxed",
+      describeRoute({
+        summary: "Start durable run with sandbox workspace preflight",
+        operationId: "durable.runSandboxed",
+        responses: {
+          200: {
+            description: "run started",
+            content: {
+              "application/json": {
+                schema: resolver(RunStarted),
+              },
+            },
+          },
+        },
+      }),
+      validator("json", RunInput),
+      async (c) => {
+        const body = c.req.valid("json")
+        const result = await executeDurableRunRequest(body, "sandboxed")
+        c.status(result.statusCode)
+        return c.json(result.payload)
       },
     )
     .post(
@@ -2819,6 +3761,7 @@ export const DurableRoutes = lazy(() =>
         }
         try {
           const id = rid("durable-exec")
+          const resolvedAgentConfig = await resolveAgentConfig(body, "inline-execute-plan-agent")
           const workflowInput: DurableRunPayload = {
             workflowID: id,
             parentExecutionID: body.parentExecutionId?.trim() || "",
@@ -2830,10 +3773,10 @@ export const DurableRoutes = lazy(() =>
             workspaceRef: body.workspaceRef?.trim() || "",
             prompt,
             cwd: body.cwd?.trim() || Instance.directory,
-            agent: body.agentConfig?.name?.trim() || "build",
-            model: await resolveModel(body),
-            tools: await resolveTools(body),
-            instructions: body.agentConfig?.instructions ?? body.instructions ?? undefined,
+            agent: resolvedAgentConfig.name || "build",
+            model: await resolveModel(body, resolvedAgentConfig),
+            tools: await resolveTools(body, resolvedAgentConfig),
+            instructions: resolvedAgentConfig.instructions ?? undefined,
           }
           const instanceID = await withWorkflowClient((client) =>
             client.scheduleNewWorkflow(durableRunWorkflow, workflowInput, id),
@@ -2882,16 +3825,17 @@ export const DurableRoutes = lazy(() =>
         }
         try {
           const id = rid("durable-plan")
-          const timeoutMinutes = body.agentConfig?.timeoutMinutes ?? 10
+          const resolvedAgentConfig = await resolveAgentConfig(body, "inline-plan-agent")
+          const timeoutMinutes = resolvedAgentConfig.timeoutMinutes ?? body.agentConfig?.timeoutMinutes ?? 10
           const timeoutSeconds = Math.min(Math.max(timeoutMinutes * 60 + 30, 90), 3600)
           const workflowInput: DurablePlanPayload = {
             workflowID: id,
             prompt,
             cwd: body.cwd?.trim() || Instance.directory,
-            agent: body.agentConfig?.name?.trim() || "plan",
-            model: await resolveModel(body),
-            tools: await resolveTools(body),
-            instructions: body.agentConfig?.instructions ?? body.instructions ?? undefined,
+            agent: resolvedAgentConfig.name || "plan",
+            model: await resolveModel(body, resolvedAgentConfig),
+            tools: await resolveTools(body, resolvedAgentConfig),
+            instructions: resolvedAgentConfig.instructions ?? undefined,
           }
           const state = await withWorkflowClient(async (client) => {
             const instanceID = await client.scheduleNewWorkflow(durablePlanWorkflow, workflowInput, id)
@@ -2934,6 +3878,65 @@ export const DurableRoutes = lazy(() =>
           return c.json({
             success: false,
             error: isInputValidationError(message) ? message : `durable runtime unavailable: ${message}`,
+          })
+        }
+      },
+    )
+    .post(
+      "/run/:workflowID/terminate",
+      describeRoute({
+        summary: "Terminate durable-compatible run",
+        operationId: "durable.runTerminate",
+        responses: {
+          200: {
+            description: "run terminated",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({
+                  success: z.boolean(),
+                  workflow_id: z.string(),
+                  cleanedWorkspace: z.boolean().optional(),
+                })),
+              },
+            },
+          },
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          workflowID: z.string(),
+        }),
+      ),
+      async (c) => {
+        const workflowID = c.req.valid("param").workflowID.trim()
+        if (!workflowID) {
+          c.status(400)
+          return c.json({
+            success: false,
+            workflow_id: "",
+            error: "workflowID is required",
+          })
+        }
+        const body = await c.req.json().catch(() => ({} as Record<string, unknown>))
+        const reason = typeof body.reason === "string" && body.reason.trim()
+          ? body.reason.trim()
+          : "terminated via durable-agent API"
+        try {
+          await withWorkflowClient((client) => client.terminateWorkflow(workflowID, reason))
+          const workspaceRef = durableToWorkspace.get(workflowID)
+          const cleanedWorkspace = workspaceRef ? await cleanupWorkspaceRef(workspaceRef) : false
+          return c.json({
+            success: true,
+            workflow_id: workflowID,
+            cleanedWorkspace,
+          })
+        } catch (error: unknown) {
+          c.status(503)
+          return c.json({
+            success: false,
+            workflow_id: workflowID,
+            error: error instanceof Error ? error.message : String(error),
           })
         }
       },

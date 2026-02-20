@@ -22,6 +22,7 @@ import { SystemPrompt } from "./system"
 import { Flag } from "@/flag/flag"
 import { PermissionNext } from "@/permission/next"
 import { Auth } from "@/auth"
+import { Telemetry } from "@/util/telemetry"
 
 export namespace LLM {
   const log = Log.create({ service: "llm" })
@@ -249,13 +250,18 @@ export namespace LLM {
           },
         ],
       }),
-      experimental_telemetry: {
-        isEnabled: cfg.experimental?.openTelemetry,
+      ...Telemetry.ai({
+        enabled: Config.openTelemetryEnabled(cfg),
+        functionId: "session.stream",
         metadata: {
           userId: cfg.username ?? "unknown",
           sessionId: input.sessionID,
+          providerId: input.model.providerID,
+          modelId: input.model.id,
+          agent: input.agent.name,
+          mode: input.agent.mode,
         },
-      },
+      }),
     })
   }
 

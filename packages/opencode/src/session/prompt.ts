@@ -61,6 +61,7 @@ const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested struc
 
 export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
+  export const SANDBOX_WORKSPACE_TOOL_MODE_KEY = "__opencode_sandbox_workspace"
 
   const state = Instance.state(
     () => {
@@ -166,6 +167,7 @@ export namespace SessionPrompt {
     // prompting
     const permissions: PermissionNext.Ruleset = []
     for (const [tool, enabled] of Object.entries(input.tools ?? {})) {
+      if (tool.startsWith("__opencode_")) continue
       permissions.push({
         permission: tool,
         action: enabled ? "allow" : "deny",
@@ -744,6 +746,7 @@ export namespace SessionPrompt {
   }) {
     using _ = log.time("resolveTools")
     const tools: Record<string, AITool> = {}
+    const sandboxWorkspaceMode = input.tools?.[SANDBOX_WORKSPACE_TOOL_MODE_KEY] === true
 
     const context = (args: any, options: ToolCallOptions): Tool.Context => ({
       sessionID: input.session.id,
@@ -783,6 +786,7 @@ export namespace SessionPrompt {
     for (const item of await ToolRegistry.tools(
       { modelID: input.model.api.id, providerID: input.model.providerID },
       input.agent,
+      { sandboxWorkspaceMode },
     )) {
       const schema = ProviderTransform.schema(input.model, z.toJSONSchema(item.parameters))
       tools[item.id] = tool({

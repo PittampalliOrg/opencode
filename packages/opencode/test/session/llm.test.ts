@@ -10,6 +10,7 @@ import { ModelsDev } from "../../src/provider/models"
 import { tmpdir } from "../fixture/fixture"
 import type { Agent } from "../../src/agent/agent"
 import type { MessageV2 } from "../../src/session/message-v2"
+import { Telemetry } from "../../src/util/telemetry"
 
 describe("session.llm.hasToolCalls", () => {
   test("returns false for empty messages array", () => {
@@ -663,5 +664,148 @@ describe("session.llm.stream", () => {
         expect(config?.maxOutputTokens).toBe(ProviderTransform.maxOutputTokens(resolved))
       },
     })
+  })
+
+  test("passes experimental telemetry metadata into AI SDK calls", async () => {
+    const server = state.server
+    if (!server) {
+      throw new Error("Server not initialized")
+    }
+
+    const source = await loadFixture("openai", "gpt-5.2")
+    const model = source.model
+
+    const responseChunks = [
+      {
+        type: "response.created",
+        response: {
+          id: "resp-telemetry",
+          created_at: Math.floor(Date.now() / 1000),
+          model: model.id,
+          service_tier: null,
+        },
+      },
+      {
+        type: "response.output_text.delta",
+        item_id: "item-telemetry",
+        delta: "ok",
+        logprobs: null,
+      },
+      {
+        type: "response.completed",
+        response: {
+          incomplete_details: null,
+          usage: {
+            input_tokens: 1,
+            input_tokens_details: null,
+            output_tokens: 1,
+            output_tokens_details: null,
+          },
+          service_tier: null,
+        },
+      },
+    ]
+    const request = waitRequest("/responses", createEventResponse(responseChunks, true))
+
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "opencode.json"),
+          JSON.stringify({
+            $schema: "https://opencode.ai/config.json",
+            username: "telemetry-user",
+            enabled_providers: ["openai"],
+            experimental: {
+              open_telemetry: true,
+            },
+            provider: {
+              openai: {
+                name: "OpenAI",
+                env: ["OPENAI_API_KEY"],
+                npm: "@ai-sdk/openai",
+                api: "https://api.openai.com/v1",
+                models: {
+                  [model.id]: model,
+                },
+                options: {
+                  apiKey: "test-openai-key",
+                  baseURL: `${server.url.origin}/v1`,
+                },
+              },
+            },
+          }),
+        )
+      },
+    })
+
+    const calls: Array<Parameters<typeof Telemetry.ai>[0]> = []
+    const original = Telemetry.ai
+    Telemetry.ai = ((input) => {
+      calls.push(input)
+      return original(input)
+    }) as typeof Telemetry.ai
+
+    try {
+      await Instance.provide({
+        directory: tmp.path,
+        fn: async () => {
+          const resolved = await Provider.getModel("openai", model.id)
+          const sessionID = "session-telemetry-1"
+          const agent = {
+            name: "telemetry-agent",
+            mode: "primary",
+            options: {},
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+            temperature: 0.2,
+          } satisfies Agent.Info
+
+          const user = {
+            id: "user-telemetry-1",
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: "openai", modelID: resolved.id },
+            variant: "high",
+          } satisfies MessageV2.User
+
+          const stream = await LLM.stream({
+            user,
+            sessionID,
+            model: resolved,
+            agent,
+            system: ["You are a helpful assistant."],
+            abort: new AbortController().signal,
+            messages: [{ role: "user", content: "Hello telemetry" }],
+            tools: {},
+          })
+
+          for await (const _ of stream.fullStream) {
+          }
+
+          await request
+        },
+      })
+    } finally {
+      Telemetry.ai = original
+    }
+
+    expect(calls.length).toBeGreaterThanOrEqual(1)
+    expect(calls[0]).toEqual(
+      expect.objectContaining({
+        enabled: true,
+        functionId: "session.stream",
+      }),
+    )
+    expect(calls[0]?.metadata).toEqual(
+      expect.objectContaining({
+        userId: "telemetry-user",
+        sessionId: "session-telemetry-1",
+        providerId: "openai",
+        modelId: model.id,
+        agent: "telemetry-agent",
+        mode: "primary",
+      }),
+    )
   })
 })

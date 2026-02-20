@@ -130,11 +130,20 @@ export namespace ToolRegistry {
       modelID: string
     },
     agent?: Agent.Info,
+    options?: {
+      sandboxWorkspaceMode?: boolean
+    },
   ) {
     const tools = await all()
+    const sandboxWorkspaceMode = options?.sandboxWorkspaceMode === true
+    const sandboxWorkspaceAllowed = sandboxWorkspaceMode
+      ? new Set(["read", "list", "write", "edit", "bash"])
+      : undefined
     const result = await Promise.all(
       tools
         .filter((t) => {
+          if (sandboxWorkspaceAllowed && !sandboxWorkspaceAllowed.has(t.id)) return false
+
           // Enable websearch/codesearch for zen users OR via enable flag
           if (t.id === "codesearch" || t.id === "websearch") {
             return model.providerID === "opencode" || Flag.OPENCODE_ENABLE_EXA
@@ -143,6 +152,8 @@ export namespace ToolRegistry {
           // use apply tool in same format as codex
           const usePatch =
             model.modelID.includes("gpt-") && !model.modelID.includes("oss") && !model.modelID.includes("gpt-4")
+          if (sandboxWorkspaceMode && t.id === "apply_patch") return false
+          if (sandboxWorkspaceMode && (t.id === "edit" || t.id === "write")) return true
           if (t.id === "apply_patch") return usePatch
           if (t.id === "edit" || t.id === "write") return !usePatch
 

@@ -1191,6 +1191,10 @@ export namespace Config {
             .boolean()
             .optional()
             .describe("Enable OpenTelemetry spans for AI SDK calls (using the 'experimental_telemetry' flag)"),
+          open_telemetry: z
+            .boolean()
+            .optional()
+            .describe("@deprecated Use experimental.openTelemetry. Enables OpenTelemetry spans for AI SDK calls."),
           primary_tools: z
             .array(z.string())
             .optional()
@@ -1372,6 +1376,10 @@ export namespace Config {
 
   export async function get() {
     return state().then((x) => x.config)
+  }
+
+  export function openTelemetryEnabled(input: Pick<Info, "experimental">) {
+    return input.experimental?.openTelemetry ?? input.experimental?.open_telemetry
   }
 
   export async function getGlobal() {

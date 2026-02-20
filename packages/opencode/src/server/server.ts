@@ -39,7 +39,7 @@ import { errors } from "./error"
 import { QuestionRoutes } from "./routes/question"
 import { PermissionRoutes } from "./routes/permission"
 import { GlobalRoutes } from "./routes/global"
-import { DurableRoutes } from "./routes/durable"
+import { DurableRoutes, applyConfigStorePush } from "./routes/durable"
 import { MDNS } from "./mdns"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
@@ -82,6 +82,7 @@ export namespace Server {
           // Allow CORS preflight requests to succeed without auth.
           // Browser clients sending Authorization headers will preflight with OPTIONS.
           if (c.req.method === "OPTIONS") return next()
+          if (c.req.path === "/configuration" || c.req.path.startsWith("/configuration/")) return next()
           const password = Flag.OPENCODE_SERVER_PASSWORD
           if (!password) return next()
           const username = Flag.OPENCODE_SERVER_USERNAME ?? "opencode"
@@ -193,6 +194,28 @@ export namespace Server {
             return c.json(true)
           },
         )
+        .post("/configuration", async (c) => {
+          const payload = await c.req.json().catch(() => ({}))
+          const result = applyConfigStorePush({ payload })
+          return c.json({ ok: true, ...result })
+        })
+        .post("/configuration/:storeName", async (c) => {
+          const payload = await c.req.json().catch(() => ({}))
+          const result = applyConfigStorePush({
+            storeName: c.req.param("storeName"),
+            payload,
+          })
+          return c.json({ ok: true, ...result })
+        })
+        .post("/configuration/:storeName/:key", async (c) => {
+          const payload = await c.req.json().catch(() => ({}))
+          const result = applyConfigStorePush({
+            storeName: c.req.param("storeName"),
+            key: c.req.param("key"),
+            payload,
+          })
+          return c.json({ ok: true, ...result })
+        })
         .use(async (c, next) => {
           if (c.req.path === "/log") return next()
           const raw = c.req.query("directory") || c.req.header("x-opencode-directory") || process.cwd()
