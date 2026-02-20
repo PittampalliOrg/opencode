@@ -27,3 +27,7 @@ target
 opencode-dev
 logs/
 *.bun-build
+.opencode/init
+.opencode/opencode.db
+.opencode/opencode.db-shm
+.opencode/opencode.db-wal
