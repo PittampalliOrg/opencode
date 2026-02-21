@@ -391,11 +391,15 @@ type DurableRunResult = {
 type DurablePlanPayload = {
   workflowID: string
   prompt: string
+  executionID?: string
+  dbExecutionID?: string
+  workspaceRef?: string
   cwd?: string
   agent?: string
   model?: ModelRef
   tools?: Record<string, boolean>
   instructions?: string
+  hardTimeoutMinutes?: number
 }
 
 type DurablePlanResult = {
@@ -455,6 +459,7 @@ type WorkspaceSession = Omit<WorkspaceSessionRecord, "readPaths"> & {
 type WorkspaceActionInput = {
   workspaceRef?: string
   executionId?: string
+  dbExecutionId?: string
   durableInstanceId?: string
 }
 
@@ -1239,6 +1244,17 @@ async function resolveWorkspaceFromInput(input: WorkspaceActionInput) {
   const byExecution = input.executionId?.trim() || ""
   if (byExecution) {
     const ref = executionToWorkspace.get(byExecution)
+    if (ref) {
+      const session = workspaceSessions.get(ref)
+      if (session) {
+        touchWorkspace(session)
+        return session
+      }
+    }
+  }
+  const byDbExecution = input.dbExecutionId?.trim() || ""
+  if (byDbExecution && byDbExecution !== byExecution) {
+    const ref = executionToWorkspace.get(byDbExecution)
     if (ref) {
       const session = workspaceSessions.get(ref)
       if (session) {
@@ -2553,13 +2569,15 @@ async function localDirectoryExists(value: string) {
 async function preflightSandboxedRun(input: DurableRunPayload) {
   if (input.executionMode !== "sandboxed") return
   const workspaceRef = input.workspaceRef?.trim() || ""
-  const executionId = input.executionID?.trim() || input.dbExecutionID?.trim() || ""
-  if (!workspaceRef && !executionId) {
+  const executionId = input.executionID?.trim() || ""
+  const dbExecutionId = input.dbExecutionID?.trim() || ""
+  if (!workspaceRef && !executionId && !dbExecutionId) {
     throw new Error("sandboxed durable run requires workspaceRef or executionId")
   }
   const session = await resolveWorkspaceFromInput({
     workspaceRef: workspaceRef || undefined,
     executionId: executionId || undefined,
+    dbExecutionId: dbExecutionId || undefined,
     durableInstanceId: input.workflowID,
   })
   await bindWorkspaceDurableInstance(session, input.workflowID)
@@ -2775,7 +2793,8 @@ async function runPrompt(input: {
   hardTimeoutMinutes?: number
   workspaceSession?: WorkspaceSession
 }) {
-  return await withDir(input.cwd, async () => {
+  const contextCwd = input.cwd?.trim() || (input.workspaceSession ? process.cwd() : undefined)
+  return await withDir(contextCwd, async () => {
     const tools = input.workspaceSession
       ? {
           ...(input.tools ?? {}),
@@ -3311,13 +3330,55 @@ async function durablePublishCompletionActivity(
 }
 
 async function durablePlanActivity(_ctx: WorkflowActivityContext, input: DurablePlanPayload): Promise<DurablePlanResult> {
+  const workspaceRef = input.workspaceRef?.trim() || ""
+  const executionID = input.executionID?.trim() || ""
+  const dbExecutionID = input.dbExecutionID?.trim() || ""
+  const workspaceSession = workspaceRef || executionID || dbExecutionID
+    ? await resolveWorkspaceFromInput({
+        workspaceRef: workspaceRef || undefined,
+        executionId: executionID || undefined,
+        dbExecutionId: dbExecutionID || undefined,
+        durableInstanceId: input.workflowID,
+      })
+    : undefined
+  if (workspaceSession) {
+    await bindWorkspaceDurableInstance(workspaceSession, input.workflowID)
+    const clonePath = workspaceSession.clonePath?.trim() || ""
+    if (clonePath) {
+      const sandboxPath = await executeSandboxCommand({
+        session: workspaceSession,
+        command: `test -d ${shellEscape(clonePath)}`,
+        cwd: workspaceSession.rootPath,
+        timeoutMs: Math.min(workspaceSession.commandTimeoutMs, 15000),
+      })
+      if (!sandboxPath.success) {
+        throw new Error(`workspace clone path is unavailable in sandbox: ${clonePath}`)
+      }
+    }
+  }
+  const requestedCwd = input.cwd?.trim() || ""
+  let localCwd = requestedCwd || undefined
+  if (requestedCwd && !(await localDirectoryExists(requestedCwd))) {
+    if (workspaceSession) {
+      log.warn("plan cwd is not accessible locally; using sandbox workspace tools without local cwd", {
+        workflowID: input.workflowID,
+        cwd: requestedCwd,
+        workspaceRef: workspaceSession.workspaceRef,
+      })
+      localCwd = process.cwd()
+    } else {
+      throw new Error(`durable plan cwd is not accessible locally: ${requestedCwd}`)
+    }
+  }
   const msg = await runPrompt({
     prompt: input.prompt,
-    cwd: input.cwd,
+    cwd: localCwd,
     model: input.model,
     tools: input.tools,
     instructions: input.instructions,
     agent: input.agent ?? "plan",
+    hardTimeoutMinutes: input.hardTimeoutMinutes,
+    workspaceSession,
   })
   const result = toResult(msg)
   const final = typeof result.final_answer === "string" ? result.final_answer : ""
@@ -3507,7 +3568,7 @@ async function executeDurableRunRequest(
     const workflowInput: DurableRunPayload = {
       workflowID: id,
       parentExecutionID: body.parentExecutionId?.trim() || "",
-      executionID: body.executionId?.trim() || "",
+      executionID: body.executionId?.trim() || body.parentExecutionId?.trim() || "",
       dbExecutionID: body.dbExecutionId?.trim() || "",
       workflowDefinitionID: body.workflowId?.trim() || "",
       nodeID: body.nodeId?.trim() || "",
@@ -3762,10 +3823,12 @@ export const DurableRoutes = lazy(() =>
         try {
           const id = rid("durable-exec")
           const resolvedAgentConfig = await resolveAgentConfig(body, "inline-execute-plan-agent")
+          const sandboxedExecution =
+            body.workspaceRef?.trim() || body.executionId?.trim() || body.dbExecutionId?.trim()
           const workflowInput: DurableRunPayload = {
             workflowID: id,
             parentExecutionID: body.parentExecutionId?.trim() || "",
-            executionID: body.executionId?.trim() || "",
+            executionID: body.executionId?.trim() || body.parentExecutionId?.trim() || "",
             dbExecutionID: body.dbExecutionId?.trim() || "",
             workflowDefinitionID: body.workflowId?.trim() || "",
             nodeID: body.nodeId?.trim() || "",
@@ -3777,6 +3840,7 @@ export const DurableRoutes = lazy(() =>
             model: await resolveModel(body, resolvedAgentConfig),
             tools: await resolveTools(body, resolvedAgentConfig),
             instructions: resolvedAgentConfig.instructions ?? undefined,
+            executionMode: sandboxedExecution ? "sandboxed" : parseRunExecutionMode(body),
           }
           const instanceID = await withWorkflowClient((client) =>
             client.scheduleNewWorkflow(durableRunWorkflow, workflowInput, id),
@@ -3826,16 +3890,23 @@ export const DurableRoutes = lazy(() =>
         try {
           const id = rid("durable-plan")
           const resolvedAgentConfig = await resolveAgentConfig(body, "inline-plan-agent")
-          const timeoutMinutes = resolvedAgentConfig.timeoutMinutes ?? body.agentConfig?.timeoutMinutes ?? 10
+          const timeoutMinutes = resolvedAgentConfig.timeoutMinutes
+            ?? body.timeoutMinutes
+            ?? body.agentConfig?.timeoutMinutes
+            ?? 10
           const timeoutSeconds = Math.min(Math.max(timeoutMinutes * 60 + 30, 90), 3600)
           const workflowInput: DurablePlanPayload = {
             workflowID: id,
             prompt,
+            executionID: body.executionId?.trim() || body.parentExecutionId?.trim() || "",
+            dbExecutionID: body.dbExecutionId?.trim() || "",
+            workspaceRef: body.workspaceRef?.trim() || "",
             cwd: body.cwd?.trim() || Instance.directory,
             agent: resolvedAgentConfig.name || "plan",
             model: await resolveModel(body, resolvedAgentConfig),
             tools: await resolveTools(body, resolvedAgentConfig),
             instructions: resolvedAgentConfig.instructions ?? undefined,
+            hardTimeoutMinutes: timeoutMinutes,
           }
           const state = await withWorkflowClient(async (client) => {
             const instanceID = await client.scheduleNewWorkflow(durablePlanWorkflow, workflowInput, id)
